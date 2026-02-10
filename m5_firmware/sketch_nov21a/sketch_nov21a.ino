@@ -1,9 +1,14 @@
-// M5StickC Plus 2 + MAX30102 — BLE Epoch (ML-ready)
-// BtnA: Start/Stop session (ONLY then 30s epoch rows are sent + saved)
+// M5StickC Plus 2 + MAX30102 — BLE RAW (ML-ready)
+// BtnA: Start/Stop session (ONLY then samples are sent + saved)
 // BtnB: If NOT recording -> dump file to Serial; If recording -> cycle brightness
 //
-// Epoch row (every 30s, while recording):
-// conf,meanHR,rmssd,activityCount,axMean,ayMean,azMean,axStd,ayStd,azStd,magMean,magStd
+// Sample row (while recording):
+// timestamp_ms,hr_bpm,acc_x,acc_y,acc_z
+//
+// HR behavior:
+// - NOT dependent on confidence
+// - Acts like accelerometer stream: always outputs HR if recently valid
+// - Holds last valid HR for HR_HOLD_MS during brief dropouts/noise
 //
 // BLE: Nordic UART Service (NUS)
 // - Service: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
@@ -47,12 +52,12 @@ const unsigned long NO_BEAT_TIMEOUT_MS = 3000;
 const unsigned long IBI_MIN_MS = 300;
 const unsigned long IBI_MAX_MS = 2400;
 
-// -------- Epoch (30s) --------
+// -------- Epoch (kept but not used for output) --------
 const uint32_t EPOCH_MS = 30000;
 uint32_t epochStartMs = 0;
 uint32_t epochActivityCount = 0;
 
-// -------- Epoch accel features (30s) --------
+// -------- Epoch accel features (kept but not used for output) --------
 double axSum=0, aySum=0, azSum=0;
 double ax2Sum=0, ay2Sum=0, az2Sum=0;
 double magSum=0, mag2Sum=0;
@@ -76,28 +81,37 @@ float motionMag = 0.0f;
 const float MOTION_ALPHA = 0.15f;
 const float MOTION_THRESH = 0.02f;
 
-// HRV
+// HRV (kept)
 const int IBI_BUF = 16;
 unsigned long ibis[IBI_BUF];
 int ibiPos = 0, ibiCount = 0;
 float rmssdMs = -1.0f;
 
-// Quality
+// Quality (kept for display only)
 int confPct = 0;
 int consecutiveBeats = 0;
 
-// Mean HR (high confidence only)
+// Mean HR (kept, but no longer gated by confidence)
 double hrSum = 0.0;
 unsigned long hrCount = 0;
 double meanHR = -1.0;
 
-// Track finger freshness so overlay doesn't "freeze" HR
+// Track finger freshness
 unsigned long lastFingerSeenMs = 0;
 
 // Session / logging (BtnA controls this)
 bool recording = false;
 File logFile;
 size_t rowsWritten = 0;
+
+// Sample send rate (ms)
+const uint32_t SAMPLE_SEND_PERIOD_MS = 100; // 10Hz
+uint32_t lastSendMs = 0;
+
+// ✅ NEW: hold-last HR like accelerometer stream
+int lastValidBpm = -1;
+uint32_t lastValidBpmMs = 0;
+const uint32_t HR_HOLD_MS = 5000; // keep last HR for 5 seconds during dropouts
 
 // ---------- BLE (NUS / UART) ----------
 static NimBLEServer* pServer = nullptr;
@@ -151,7 +165,6 @@ void bleStartAdvertising() {
   Serial.println(NUS_SERVICE_UUID);
 }
 
-// Debug + keeps flags consistent (safe)
 void blePollConnectionStatus() {
   static int lastCount = -1;
   int cnt = 0;
@@ -178,8 +191,6 @@ void bleInit() {
   NimBLEDevice::init(DEV_NAME);
   NimBLEDevice::setDeviceName(DEV_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-
-  // Try to increase MTU (phone may accept or ignore)
   NimBLEDevice::setMTU(185);
 
   pServer = NimBLEDevice::createServer();
@@ -199,16 +210,14 @@ void bleInit() {
   bleStartAdvertising();
 }
 
-// ✅ FIXED: robust chunked notify, ONE newline at end, no min() dependency
 void bleSendLine(const String& line) {
   if (!pTxCharacteristic) return;
   if (!bleConnected) return;
 
-  // Only ONE newline at end (the phone uses '\n' to split lines)
   String msg = line;
   msg += "\n";
 
-  const size_t CHUNK = 20; // safe for default MTU
+  const size_t CHUNK = 20;
   const size_t L = msg.length();
 
   for (size_t i = 0; i < L; i += CHUNK) {
@@ -218,9 +227,19 @@ void bleSendLine(const String& line) {
     String part = msg.substring(i, end);
     pTxCharacteristic->setValue((uint8_t*)part.c_str(), part.length());
     pTxCharacteristic->notify();
-
-    delay(8); // helps older phones
+    delay(8);
   }
+}
+
+// build + send 5-column sample line
+void bleSendSample(uint32_t t_ms, int hr_bpm, float ax, float ay, float az) {
+  String line =
+    String(t_ms) + "," +
+    String(hr_bpm) + "," +
+    String(ax, 5) + "," +
+    String(ay, 5) + "," +
+    String(az, 5);
+  bleSendLine(line);
 }
 
 // ----------------- Helpers -----------------
@@ -258,6 +277,10 @@ void resetSessionStats() {
   meanHR = -1.0;
 
   lastFingerSeenMs = 0;
+
+  // reset hold-last HR
+  lastValidBpm = -1;
+  lastValidBpmMs = 0;
 
   resetEpoch();
 }
@@ -334,18 +357,19 @@ void computeRMSSD() {
 bool startRecording() {
   resetSessionStats();
 
-  logFile = SPIFFS.open("/hr_demo.csv", FILE_WRITE);
+  logFile = SPIFFS.open("/sleep_raw.csv", FILE_WRITE);
   if (!logFile) {
-    Serial.println("[ERR] open /hr_demo.csv failed");
+    Serial.println("[ERR] open /sleep_raw.csv failed");
     return false;
   }
 
-  logFile.println("conf,meanHR,rmssd,activityCount,axMean,ayMean,azMean,axStd,ayStd,azStd,magMean,magStd");
+  logFile.println("timestamp_ms,hr_bpm,acc_x,acc_y,acc_z");
   logFile.flush();
 
   rowsWritten = 0;
+  lastSendMs = 0;
   recording = true;
-  Serial.println("[REC] started (BtnA) -> epochs will send every 30s");
+  Serial.println("[REC] started (BtnA) -> samples will send");
   return true;
 }
 
@@ -358,16 +382,19 @@ void stopRecording() {
 }
 
 void dumpFileToSerial() {
-  File f = SPIFFS.open("/hr_demo.csv", FILE_READ);
-  if (!f) { Serial.println("[INFO] No /hr_demo.csv found"); return; }
-  Serial.println("--- BEGIN /hr_demo.csv ---");
+  File f = SPIFFS.open("/sleep_raw.csv", FILE_READ);
+  if (!f) { Serial.println("[INFO] No /sleep_raw.csv found"); return; }
+  Serial.println("--- BEGIN /sleep_raw.csv ---");
   while (f.available()) { Serial.println(f.readStringUntil('\n')); delay(1); }
   f.close();
-  Serial.println("--- END /hr_demo.csv ---");
+  Serial.println("--- END /sleep_raw.csv ---");
 }
 
 // ---- overlay ----
-void drawOverlay(uint32_t ir) {
+// Replace ONLY your drawOverlay() with this version.
+// It shows: HR (held like output), and ax/ay/az live.
+
+void drawOverlay(uint32_t ir, float ax, float ay, float az) {
   auto& d = M5.Display;
   if (millis() - lastDrawMs < 100) return;
   lastDrawMs = millis();
@@ -384,7 +411,7 @@ void drawOverlay(uint32_t ir) {
     d.fillRoundRect(x, y, w, h, 6, TFT_RED);
     d.setTextSize(1);
     d.setTextColor(TFT_WHITE, TFT_RED);
-    d.setCursor(x+10, y+4);
+    d.setCursor(x + 10, y + 4);
     d.print("REC");
   }
 
@@ -396,24 +423,34 @@ void drawOverlay(uint32_t ir) {
   d.setCursor(6, 30);
   d.printf("Name:%s", DEV_NAME);
 
+  // ✅ Compute displayed HR same as your outgoing HR (hold-last)
+  uint32_t nowMs = millis();
+  int hrDisp = -1;
+  if (BPM > 0) hrDisp = BPM;
+  else if (lastValidBpm > 0 && (nowMs - lastValidBpmMs) <= HR_HOLD_MS) hrDisp = lastValidBpm;
+
+  // HR line
   d.setTextSize(2);
   d.setTextColor(TFT_YELLOW, TFT_BLACK);
-  d.setCursor(6, 44);
-  d.printf("conf:%d%%", confPct);
+  d.setCursor(6, 48);
+  if (hrDisp > 0) d.printf("HR:%d", hrDisp);
+  else            d.print("HR:--");
 
+  // Rows count
   d.setTextSize(1);
   d.setTextColor(TFT_CYAN, TFT_BLACK);
-  d.setCursor(6, 70);
-  d.printf("act:%lu", (unsigned long)epochActivityCount);
+  d.setCursor(6, 76);
+  d.printf("rows:%lu", (unsigned long)rowsWritten);
 
-  d.setCursor(6, 94);
-  bool fingerRecent = (millis() - lastFingerSeenMs) < 1200;
-  if (fingerRecent && meanHR > 0) d.printf("HR:%.0f", meanHR);
-  else                            d.printf("HR:--");
+  // ✅ Accel lines
+  d.setCursor(6, 92);
+  d.printf("ax:% .3f", ax);
 
-  d.setCursor(6, 106);
-  if (fingerRecent && rmssdMs > 0) d.printf("RMSSD:%.0f", rmssdMs);
-  else                             d.printf("RMSSD:--");
+  d.setCursor(6, 104);
+  d.printf("ay:% .3f", ay);
+
+  d.setCursor(6, 116);
+  d.printf("az:% .3f", az);
 
   d.endWrite();
 }
@@ -497,6 +534,7 @@ void loop() {
   motionMag = MOTION_ALPHA*deltaMag + (1.0f - MOTION_ALPHA)*motionMag;
   lastAx=ax; lastAy=ay; lastAz=az;
 
+  // keep epoch accumulators (not used in output)
   if (recording) {
     if (deltaMag > MOTION_THRESH) epochActivityCount++;
 
@@ -534,8 +572,20 @@ void loop() {
             }
             BPM = (valid >= 2) ? (sum / valid) : (int)lroundf(bpmInst);
 
+            // ✅ NEW: update last-valid HR immediately (no confidence gating)
+            if (BPM > 0) {
+              lastValidBpm = BPM;
+              lastValidBpmMs = now;
+
+              // also keep meanHR updated (optional, not used for output)
+              hrSum += (double)BPM;
+              hrCount++;
+              meanHR = hrSum / (double)hrCount;
+            }
+
             lastBeatSeenMs = now;
 
+            // keep IBI + confidence for display (does not affect HR output)
             if (ibiCount == 0) {
               ibis[0] = IBI;
               ibis[1] = IBI;
@@ -553,12 +603,6 @@ void loop() {
             int motionPenalty = (motionMag > 0.20f) ? 25 : 0;
             confPct = base - irPenalty - motionPenalty;
             confPct = constrain(confPct, 0, 100);
-
-            if (confPct >= 70 && BPM > 0) {
-              hrSum += (double)BPM;
-              hrCount++;
-              meanHR = hrSum / (double)hrCount;
-            }
           }
         }
       }
@@ -581,54 +625,44 @@ void loop() {
 
   computeRMSSD();
 
-  // Epoch end (only while recording)
+  // Send raw sample rows while recording
   if (recording) {
-    if (epochStartMs == 0) epochStartMs = millis();
-    if (millis() - epochStartMs >= EPOCH_MS) {
-      float rmssdOut  = (confPct >= 70 && BPM > 0) ? rmssdMs : -1.0f;
-      float meanHROut = (meanHR > 0) ? (float)meanHR : -1.0f;
+    uint32_t nowMs = millis();
+    if (nowMs - lastSendMs >= SAMPLE_SEND_PERIOD_MS) {
+      lastSendMs = nowMs;
 
-      auto stdFrom = [&](double s, double s2) -> float {
-        if (accN < 2) return 0.0f;
-        double mean = s / (double)accN;
-        double var  = (s2 / (double)accN) - (mean * mean);
-        if (var < 0) var = 0;
-        return (float)sqrt(var);
-      };
+      // ✅ HR behaves like accel: hold last valid HR for HR_HOLD_MS
+      int hrOut = -1;
+      if (BPM > 0) {
+        hrOut = BPM;
+      } else if (lastValidBpm > 0 && (nowMs - lastValidBpmMs) <= HR_HOLD_MS) {
+        hrOut = lastValidBpm;
+      } else {
+        hrOut = -1;
+      }
 
-      float axMean = (accN>0) ? (float)(axSum/accN) : 0;
-      float ayMean = (accN>0) ? (float)(aySum/accN) : 0;
-      float azMean = (accN>0) ? (float)(azSum/accN) : 0;
+      // BLE send
+      if (bleConnected) {
+        bleSendSample(nowMs, hrOut, ax, ay, az);
+      }
 
-      float axStd = stdFrom(axSum, ax2Sum);
-      float ayStd = stdFrom(aySum, ay2Sum);
-      float azStd = stdFrom(azSum, az2Sum);
-
-      float magMean = (accN>0) ? (float)(magSum/accN) : 0;
-      float magStd  = stdFrom(magSum, mag2Sum);
-
-      String line =
-        String(confPct) + "," +
-        String(meanHROut,1) + "," +
-        String(rmssdOut,1) + "," +
-        String(epochActivityCount) + "," +
-        String(axMean,5) + "," + String(ayMean,5) + "," + String(azMean,5) + "," +
-        String(axStd,5)  + "," + String(ayStd,5)  + "," + String(azStd,5)  + "," +
-        String(magMean,5) + "," + String(magStd,5);
-
-      bleSendLine(line);
-      Serial.print("[EPOCH] "); Serial.println(line);
-
+      // File log
       if (logFile) {
-        logFile.println(line);
+        logFile.print(nowMs);
+        logFile.print(",");
+        logFile.print(hrOut);
+        logFile.print(",");
+        logFile.print(ax, 5);
+        logFile.print(",");
+        logFile.print(ay, 5);
+        logFile.print(",");
+        logFile.println(az, 5);
         logFile.flush();
         rowsWritten++;
       }
-
-      resetEpoch();
     }
   }
 
-  drawOverlay(ir);
+  drawOverlay(ir, ax, ay, az);
   delay(10);
 }

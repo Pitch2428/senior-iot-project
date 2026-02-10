@@ -54,7 +54,7 @@ class _BleHomeState extends State<BleHome> {
 
   Timer? _flushTimer;
 
-  // ✅ NEW: queue DB writes to prevent "database is locked"
+  // queue DB writes to prevent "database is locked"
   Future<void> _dbQueue = Future.value();
 
   @override
@@ -172,36 +172,36 @@ class _BleHomeState extends State<BleHome> {
     if (mounted) setState(() => _status = "Subscribed ✅ (waiting for data)");
   }
 
-  // ---------- Parse ----------
-  Map<String, dynamic>? _parseEpoch12(String line) {
+  // ---------- Parse (timestamp_ms,hr_bpm,acc_x,acc_y,acc_z) ----------
+  Map<String, dynamic>? _parseSample5(String line) {
     final parts = line.trim().split(',');
-    if (parts.length != 12) return null;
+    if (parts.length != 5) return null;
 
     int? toInt(String s) => int.tryParse(s.trim());
     double? toDouble(String s) => double.tryParse(s.trim());
 
+    final t = toInt(parts[0]);
+    final hr = toInt(parts[1]);
+    final ax = toDouble(parts[2]);
+    final ay = toDouble(parts[3]);
+    final az = toDouble(parts[4]);
+
+    if (t == null || hr == null || ax == null || ay == null || az == null) return null;
+
     return {
-      "conf": toInt(parts[0]),
-      "meanHr": toDouble(parts[1]),
-      "rmssd": toDouble(parts[2]),
-      "activityCount": toInt(parts[3]),
-      "axMean": toDouble(parts[4]),
-      "ayMean": toDouble(parts[5]),
-      "azMean": toDouble(parts[6]),
-      "axStd": toDouble(parts[7]),
-      "ayStd": toDouble(parts[8]),
-      "azStd": toDouble(parts[9]),
-      "magMean": toDouble(parts[10]),
-      "magStd": toDouble(parts[11]),
+      "timestamp_ms": t,
+      "hr_bpm": hr,
+      "acc_x": ax,
+      "acc_y": ay,
+      "acc_z": az,
     };
   }
 
   Future<void> _refreshDbRows() async {
-    final c = await AppDb.countEpochs();
+    final c = await AppDb.countSamples();
     if (mounted) setState(() => _dbRows = c);
   }
 
-  // ✅ UPDATED: catch DB errors + refresh after each insert
   Future<void> _commitLine(String line) async {
     final cleaned = line.trim();
     if (cleaned.isEmpty) return;
@@ -214,31 +214,21 @@ class _BleHomeState extends State<BleHome> {
       });
     }
 
-    final ts = DateTime.now().millisecondsSinceEpoch;
-    final parsed = _parseEpoch12(cleaned);
+    final parsed = _parseSample5(cleaned);
+    if (parsed == null) {
+      // ignore non-data lines like CONNECTED
+      return;
+    }
 
     try {
-      if (parsed != null) {
-        await AppDb.insertEpoch(
-          ts: ts,
-          conf: parsed["conf"] as int?,
-          meanHr: parsed["meanHr"] as double?,
-          rmssd: parsed["rmssd"] as double?,
-          activityCount: parsed["activityCount"] as int?,
-          axMean: parsed["axMean"] as double?,
-          ayMean: parsed["ayMean"] as double?,
-          azMean: parsed["azMean"] as double?,
-          axStd: parsed["axStd"] as double?,
-          ayStd: parsed["ayStd"] as double?,
-          azStd: parsed["azStd"] as double?,
-          magMean: parsed["magMean"] as double?,
-          magStd: parsed["magStd"] as double?,
-          raw: cleaned,
-        );
-      } else {
-        // store raw anyway (includes CONNECTED etc.)
-        await AppDb.insertEpoch(ts: ts, raw: cleaned);
-      }
+      await AppDb.insertSample(
+        timestampMs: parsed["timestamp_ms"] as int,
+        hrBpm: parsed["hr_bpm"] as int,
+        accX: parsed["acc_x"] as double,
+        accY: parsed["acc_y"] as double,
+        accZ: parsed["acc_z"] as double,
+        raw: cleaned,
+      );
 
       await _refreshDbRows();
     } catch (e) {
@@ -249,7 +239,6 @@ class _BleHomeState extends State<BleHome> {
   }
 
   // ---------- Incoming BLE bytes ----------
-  // ✅ UPDATED: queue inserts to avoid DB lock + show errors
   void _handleIncoming(Uint8List bytes) {
     _bytesIn += bytes.length;
 
@@ -266,7 +255,6 @@ class _BleHomeState extends State<BleHome> {
     for (int i = 0; i < parts.length - 1; i++) {
       final l = parts[i].trim();
       if (l.isEmpty) continue;
-
       _dbQueue = _dbQueue.then((_) => _commitLine(l));
     }
 
@@ -294,35 +282,17 @@ class _BleHomeState extends State<BleHome> {
   }
 
   // ---------- CSV Export (Share) ----------
-  String _csvEscape(String s) {
-    final needsQuotes = s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r');
-    if (!needsQuotes) return s;
-    return '"${s.replaceAll('"', '""')}"';
-  }
-
   String _buildCsv(List<Map<String, Object?>> rows) {
     final sb = StringBuffer();
-    sb.writeln(
-      "id,ts,conf,mean_hr,rmssd,activity_count,ax_mean,ay_mean,az_mean,ax_std,ay_std,az_std,mag_mean,mag_std,raw",
-    );
+    sb.writeln("timestamp_ms,hr_bpm,acc_x,acc_y,acc_z");
 
     for (final r in rows) {
       sb.writeln([
-        r['id'] ?? '',
-        r['ts'] ?? '',
-        r['conf'] ?? '',
-        r['mean_hr'] ?? '',
-        r['rmssd'] ?? '',
-        r['activity_count'] ?? '',
-        r['ax_mean'] ?? '',
-        r['ay_mean'] ?? '',
-        r['az_mean'] ?? '',
-        r['ax_std'] ?? '',
-        r['ay_std'] ?? '',
-        r['az_std'] ?? '',
-        r['mag_mean'] ?? '',
-        r['mag_std'] ?? '',
-        _csvEscape((r['raw'] ?? '').toString()),
+        r['timestamp_ms'] ?? '',
+        r['hr_bpm'] ?? '',
+        r['acc_x'] ?? '',
+        r['acc_y'] ?? '',
+        r['acc_z'] ?? '',
       ].join(','));
     }
     return sb.toString();
@@ -332,16 +302,15 @@ class _BleHomeState extends State<BleHome> {
     try {
       setState(() => _status = "Preparing CSV export...");
 
-      final rows = await AppDb.getAllEpochs();
+      final rows = await AppDb.getAllSamples();
       if (rows.isEmpty) {
         setState(() => _status = "No data to export");
         return;
       }
 
       final csv = _buildCsv(rows);
-      final fileName = "sleep_epochs_${DateTime.now().millisecondsSinceEpoch}.csv";
+      final fileName = "sleep_raw_${DateTime.now().millisecondsSinceEpoch}.csv";
 
-      // Save to app external files folder (no storage permission needed)
       final ext = await getExternalStorageDirectory();
       if (ext == null) {
         setState(() => _status = "Export failed: external storage not available");
@@ -351,8 +320,7 @@ class _BleHomeState extends State<BleHome> {
       final file = File("${ext.path}/$fileName");
       await file.writeAsString(csv, flush: true);
 
-      await Share.shareXFiles([XFile(file.path)], text: "Sleep epochs CSV");
-
+      await Share.shareXFiles([XFile(file.path)], text: "Sleep raw CSV");
       setState(() => _status = "Saved ✅ and shared:\n${file.path}");
     } catch (e) {
       setState(() => _status = "Export failed: $e");
