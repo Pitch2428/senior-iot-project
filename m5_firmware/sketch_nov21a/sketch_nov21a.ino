@@ -1,119 +1,72 @@
-// M5StickC Plus 2 + MAX30102 — BLE RAW (ML-ready)
-// BtnA: Start/Stop session (ONLY then samples are sent + saved)
-// BtnB: If NOT recording -> dump file to Serial; If recording -> cycle brightness
-//
-// Sample row (while recording):
-// timestamp_ms,hr_bpm,acc_x,acc_y,acc_z
-//
-// HR behavior:
-// - NOT dependent on confidence
-// - Acts like accelerometer stream: always outputs HR if recently valid
-// - Holds last valid HR for HR_HOLD_MS during brief dropouts/noise
-//
-// BLE: Nordic UART Service (NUS)
-// - Service: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
-// - TX Notify: 6E400003-B5A3-F393-E0A9-E50E24DCCA9E
-// - RX Write : 6E400002-B5A3-F393-E0A9-E50E24DCCA9E
-
+#include <Arduino.h>
 #include <M5Unified.h>
 #include <Wire.h>
 #include <SPIFFS.h>
-#include <esp_task_wdt.h>
-#include <esp_log.h>
-#include "MAX30105.h"
-#include "heartRate.h"
 #include <math.h>
 #include <NimBLEDevice.h>
 
-#define SDA_PIN 33
-#define SCL_PIN 32
+#include "MAX30105.h"
+#include "heartRate.h"
+
+// ----------------- Pins -----------------
+#define SDA_PIN 32
+#define SCL_PIN 33
 #define I2C_HZ  100000
 #define MAX_ADDR 0x57
+#define HOLD_PIN 4   // M5StickC Plus2 power hold pin
 
-// -------- Sensor config --------
-const byte LED_MODE       = 2;      // Red+IR
-byte       ledBrightness  = 0xFF;   // higher start -> more stable finger detect
+// ----------------- Sensor Config -----------------
+const byte LED_MODE       = 2;      // Red + IR
+byte       ledBrightness  = 0xFF;   // Max power
 const byte SAMPLE_AVG     = 4;
 const int  SAMPLE_RATE_HZ = 100;
-const int  PWIDTH_US      = 215;
+const int  PWIDTH_US      = 411;
 const int  ADC_RANGE      = 16384;
 
-// -------- Auto-level --------
-const uint32_t IR_HARD_HIGH = 240000;
-const uint32_t IR_SOFT_HIGH = 170000;
+// ----------------- Thresholds -----------------
+const uint32_t IR_HARD_HIGH = 250000;
+const uint32_t IR_SOFT_HIGH = 210000;
 const uint32_t IR_SOFT_LOW  = 60000;
 const uint32_t IR_GOOD_MIN  = 70000;
-const uint32_t IR_GOOD_MAX  = 150000;
+const uint32_t IR_GOOD_MAX  = 180000;
 const unsigned long ADJUST_PERIOD_MS = 800;
 
-// -------- Beat limits --------
-const uint32_t FINGER_MIN_IR   = 20000;
+// ----------------- Finger & Beat Limits -----------------
+const uint32_t FINGER_MIN_IR        = 25000;
 const unsigned long NO_BEAT_TIMEOUT_MS = 3000;
-const unsigned long IBI_MIN_MS = 300;
-const unsigned long IBI_MAX_MS = 2400;
+const unsigned long IBI_MIN_MS      = 300;
+const unsigned long IBI_MAX_MS      = 2400;
 
-// -------- Epoch (kept but not used for output) --------
-const uint32_t EPOCH_MS = 30000;
-uint32_t epochStartMs = 0;
-uint32_t epochActivityCount = 0;
-
-// -------- Epoch accel features (kept but not used for output) --------
-double axSum=0, aySum=0, azSum=0;
-double ax2Sum=0, ay2Sum=0, az2Sum=0;
-double magSum=0, mag2Sum=0;
-unsigned long accN=0;
-
-// -------- Globals --------
+// ----------------- Globals -----------------
 MAX30105 sensor;
-bool hasMAX=false, imuOK=false;
+bool hasMAX = false;
+bool imuOK  = false;
 
-// HR smoothing
+// HR tracking
 const byte RATE_SIZE = 4;
 byte rates[RATE_SIZE];
 byte rateSpot = 0;
-long lastBeatMs = 0, lastBeatSeenMs = 0;
+long lastBeatMs = 0;
+long lastBeatSeenMs = 0;
 int  BPM = -1;
+int  lastValidBpm = -1;
+uint32_t lastValidBpmMs = 0;
+const uint32_t HR_HOLD_MS = 5000;
 
-// Overlay / motion
-uint32_t lastDrawMs = 0;
-float lastAx=0, lastAy=0, lastAz=0;
+// Accel & Motion
+float lastAx = 0, lastAy = 0, lastAz = 0;
 float motionMag = 0.0f;
 const float MOTION_ALPHA = 0.15f;
-const float MOTION_THRESH = 0.02f;
 
-// HRV (kept)
-const int IBI_BUF = 16;
-unsigned long ibis[IBI_BUF];
-int ibiPos = 0, ibiCount = 0;
-float rmssdMs = -1.0f;
-
-// Quality (kept for display only)
-int confPct = 0;
-int consecutiveBeats = 0;
-
-// Mean HR (kept, but no longer gated by confidence)
-double hrSum = 0.0;
-unsigned long hrCount = 0;
-double meanHR = -1.0;
-
-// Track finger freshness
-unsigned long lastFingerSeenMs = 0;
-
-// Session / logging (BtnA controls this)
+// Logging & Session
 bool recording = false;
 File logFile;
 size_t rowsWritten = 0;
-
-// Sample send rate (ms)
-const uint32_t SAMPLE_SEND_PERIOD_MS = 100; // 10Hz
 uint32_t lastSendMs = 0;
+uint32_t lastDrawMs = 0;
+const uint32_t SAMPLE_SEND_PERIOD_MS = 100;
 
-// ✅ NEW: hold-last HR like accelerometer stream
-int lastValidBpm = -1;
-uint32_t lastValidBpmMs = 0;
-const uint32_t HR_HOLD_MS = 5000; // keep last HR for 5 seconds during dropouts
-
-// ---------- BLE (NUS / UART) ----------
+// ----------------- BLE Globals -----------------
 static NimBLEServer* pServer = nullptr;
 static NimBLECharacteristic* pTxCharacteristic = nullptr;
 static bool bleConnected = false;
@@ -124,8 +77,56 @@ static bool bleAdvertising = false;
 #define NUS_CHAR_TX_UUID  "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // Notify
 #define NUS_CHAR_RX_UUID  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // Write
 
+// ----------------- Forward Declarations -----------------
 void bleSendLine(const String& line);
+void powerOffDevice();
+void stopSensor();
 
+// ----------------- Sensor Helpers -----------------
+void applyConfig() {
+  sensor.setup(ledBrightness, SAMPLE_AVG, LED_MODE, SAMPLE_RATE_HZ, PWIDTH_US, ADC_RANGE);
+  sensor.setPulseAmplitudeRed(ledBrightness);
+  sensor.setPulseAmplitudeIR(ledBrightness);
+  sensor.clearFIFO();
+}
+
+void autoLevel(uint32_t ir, bool finger) {
+  static unsigned long lastAdjust = 0;
+  if (millis() - lastAdjust < ADJUST_PERIOD_MS) return;
+  lastAdjust = millis();
+
+  bool changed = false;
+  if (ir > IR_SOFT_HIGH && ledBrightness >= 0x20) {
+    ledBrightness -= 0x10;
+    changed = true;
+  } else if (finger && ir < IR_SOFT_LOW && ledBrightness <= 0xEF) {
+    ledBrightness += 0x10;
+    changed = true;
+  }
+
+  if (changed && hasMAX) applyConfig();
+}
+
+void stopSensor() {
+  if (!hasMAX) return;
+
+  // Turn LEDs off first, then put sensor in low power
+  sensor.setPulseAmplitudeRed(0);
+  sensor.setPulseAmplitudeIR(0);
+  sensor.setPulseAmplitudeGreen(0);
+  delay(10);
+  sensor.shutDown();
+}
+
+void wakeSensor() {
+  if (!hasMAX) return;
+
+  sensor.wakeUp();
+  delay(10);
+  applyConfig();
+}
+
+// ----------------- BLE -----------------
 void bleStopAdvertising() {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   if (adv) adv->stop();
@@ -135,18 +136,21 @@ void bleStopAdvertising() {
 
 class MyServerCallbacks : public NimBLEServerCallbacks {
 public:
-  void onConnect(NimBLEServer* pS, NimBLEConnInfo& connInfo) {
-    (void)pS; (void)connInfo;
+  void onConnect(NimBLEServer* pS, NimBLEConnInfo& connInfo) override {
+    (void)pS;
+    (void)connInfo;
     bleConnected = true;
     bleStopAdvertising();
-    Serial.println("[BLE] ✅ CONNECTED");
+    Serial.println("[BLE] CONNECTED");
     bleSendLine("CONNECTED");
   }
 
-  void onDisconnect(NimBLEServer* pS, NimBLEConnInfo& connInfo, int reason) {
-    (void)pS; (void)connInfo; (void)reason;
+  void onDisconnect(NimBLEServer* pS, NimBLEConnInfo& connInfo, int reason) override {
+    (void)pS;
+    (void)connInfo;
+    (void)reason;
     bleConnected = false;
-    Serial.println("[BLE] ❌ DISCONNECTED -> restart ADV");
+    Serial.println("[BLE] DISCONNECTED -> restart ADV");
     NimBLEDevice::startAdvertising();
     bleAdvertising = true;
   }
@@ -161,19 +165,19 @@ void bleStartAdvertising() {
 
   Serial.print("[BLE] Advertising STARTED as: ");
   Serial.println(DEV_NAME);
-  Serial.print("[BLE] Service UUID: ");
-  Serial.println(NUS_SERVICE_UUID);
 }
 
 void blePollConnectionStatus() {
   static int lastCount = -1;
   int cnt = 0;
+
   if (pServer) cnt = pServer->getConnectedCount();
 
   if (cnt != lastCount) {
     lastCount = cnt;
     bleConnected = (cnt > 0);
     bleAdvertising = !bleConnected;
+
     Serial.printf("[BLE] connectedCount=%d\n", cnt);
 
     if (bleConnected) {
@@ -214,8 +218,7 @@ void bleSendLine(const String& line) {
   if (!pTxCharacteristic) return;
   if (!bleConnected) return;
 
-  String msg = line;
-  msg += "\n";
+  String msg = line + "\n";
 
   const size_t CHUNK = 20;
   const size_t L = msg.length();
@@ -231,7 +234,6 @@ void bleSendLine(const String& line) {
   }
 }
 
-// build + send 5-column sample line
 void bleSendSample(uint32_t t_ms, int hr_bpm, float ax, float ay, float az) {
   String line =
     String(t_ms) + "," +
@@ -242,424 +244,218 @@ void bleSendSample(uint32_t t_ms, int hr_bpm, float ax, float ay, float az) {
   bleSendLine(line);
 }
 
-// ----------------- Helpers -----------------
-inline bool fingerPresent(uint32_t ir) { return ir >= FINGER_MIN_IR; }
-
-void resetIBI() {
-  ibiPos = 0;
-  ibiCount = 0;
-  rmssdMs = -1.0f;
-}
-
-void resetEpoch() {
-  epochStartMs = millis();
-  epochActivityCount = 0;
-
-  axSum=aySum=azSum=0;
-  ax2Sum=ay2Sum=az2Sum=0;
-  magSum=mag2Sum=0;
-  accN=0;
-}
-
-void resetSessionStats() {
-  for (byte i=0;i<RATE_SIZE;i++) rates[i]=0;
-  rateSpot = 0;
-  BPM = -1;
-  lastBeatMs = 0;
-  lastBeatSeenMs = 0;
-
-  resetIBI();
-  confPct = 0;
-  consecutiveBeats = 0;
-
-  hrSum = 0.0;
-  hrCount = 0;
-  meanHR = -1.0;
-
-  lastFingerSeenMs = 0;
-
-  // reset hold-last HR
-  lastValidBpm = -1;
-  lastValidBpmMs = 0;
-
-  resetEpoch();
-}
-
-void applyConfig() {
-  sensor.setup(ledBrightness, SAMPLE_AVG, LED_MODE, SAMPLE_RATE_HZ, PWIDTH_US, ADC_RANGE);
-  sensor.setPulseAmplitudeRed(0x00);
-  sensor.setPulseAmplitudeGreen(0x00);
-  sensor.clearFIFO();
-}
-
-bool initMAX30102() {
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(I2C_HZ);
-  delay(80);
-
-  Wire.beginTransmission(MAX_ADDR);
-  if (Wire.endTransmission() != 0) return false;
-  if (!sensor.begin(Wire)) return false;
-
-  applyConfig();
-  resetSessionStats();
-  return true;
-}
-
-void autoLevel(uint32_t ir, bool finger) {
-  if (ir >= IR_HARD_HIGH && ledBrightness >= 0x20) {
-    ledBrightness -= 0x10;
-    applyConfig();
-    return;
-  }
-  static unsigned long lastAdjust = 0;
-  if (millis() - lastAdjust < ADJUST_PERIOD_MS) return;
-  lastAdjust = millis();
-
-  bool changed=false;
-  if (ir > IR_SOFT_HIGH && ledBrightness >= 0x14) { ledBrightness -= 0x04; changed=true; }
-  else if (finger && ir < IR_SOFT_LOW && ledBrightness <= 0xFB) { ledBrightness += 0x04; changed=true; }
-  else if (finger && ir > IR_GOOD_MAX && ledBrightness >= 0x14) { ledBrightness -= 0x04; changed=true; }
-  else if (finger && ir < IR_GOOD_MIN && ledBrightness <= 0xFB) { ledBrightness += 0x04; changed=true; }
-
-  if (changed) applyConfig();
-}
-
-void computeRMSSD() {
-  if (BPM <= 0 || ibiCount < 4) { rmssdMs = -1.0f; return; }
-
-  int K = (ibiCount < 12) ? ibiCount : 12;
-  if (K < 4) { rmssdMs = -1.0f; return; }
-
-  unsigned long win[12];
-  int idx = (ibiPos - 1 + IBI_BUF) % IBI_BUF;
-  for (int i = 0; i < K; i++) { win[i] = ibis[idx]; idx = (idx - 1 + IBI_BUF) % IBI_BUF; }
-
-  double meanIbi = 0.0;
-  for (int i = 0; i < K; i++) meanIbi += win[i];
-  meanIbi /= K;
-
-  double sumSq = 0.0;
-  int pairs = 0;
-  for (int i = 0; i < K - 1; i++) {
-    long diff = (long)win[i] - (long)win[i + 1];
-    long adiff = labs(diff);
-    if (adiff > 250) continue;
-    if (adiff > 0.20 * meanIbi) continue;
-    sumSq += (double)diff * (double)diff;
-    pairs++;
-  }
-
-  rmssdMs = (pairs >= 3) ? sqrt(sumSq / pairs) : -1.0f;
-}
-
-// ---- Recording helpers ----
-bool startRecording() {
-  resetSessionStats();
-
-  logFile = SPIFFS.open("/sleep_raw.csv", FILE_WRITE);
-  if (!logFile) {
-    Serial.println("[ERR] open /sleep_raw.csv failed");
-    return false;
-  }
-
-  logFile.println("timestamp_ms,hr_bpm,acc_x,acc_y,acc_z");
-  logFile.flush();
-
-  rowsWritten = 0;
-  lastSendMs = 0;
-  recording = true;
-  Serial.println("[REC] started (BtnA) -> samples will send");
-  return true;
-}
-
-void stopRecording() {
-  if (recording) {
-    if (logFile) { logFile.flush(); logFile.close(); }
-    recording = false;
-    Serial.printf("[REC] stopped (BtnA) rows=%u\n", (unsigned)rowsWritten);
-  }
-}
-
-void dumpFileToSerial() {
-  File f = SPIFFS.open("/sleep_raw.csv", FILE_READ);
-  if (!f) { Serial.println("[INFO] No /sleep_raw.csv found"); return; }
-  Serial.println("--- BEGIN /sleep_raw.csv ---");
-  while (f.available()) { Serial.println(f.readStringUntil('\n')); delay(1); }
-  f.close();
-  Serial.println("--- END /sleep_raw.csv ---");
-}
-
-// ---- overlay ----
-// Replace ONLY your drawOverlay() with this version.
-// It shows: HR (held like output), and ax/ay/az live.
-
+// ----------------- UI -----------------
 void drawOverlay(uint32_t ir, float ax, float ay, float az) {
-  auto& d = M5.Display;
   if (millis() - lastDrawMs < 100) return;
   lastDrawMs = millis();
 
-  d.startWrite();
-  d.fillScreen(TFT_BLACK);
+  M5.Display.startWrite();
+  M5.Display.fillScreen(TFT_BLACK);
 
-  bool finger = fingerPresent(ir);
-  d.fillCircle(8, 8, 5, finger ? TFT_GREEN : TFT_RED);
+  // Finger status
+  M5.Display.fillCircle(8, 8, 5, (ir >= FINGER_MIN_IR) ? TFT_GREEN : TFT_RED);
 
   if (recording) {
-    int w = 42, h = 16;
-    int x = d.width() - w - 6, y = 4;
-    d.fillRoundRect(x, y, w, h, 6, TFT_RED);
-    d.setTextSize(1);
-    d.setTextColor(TFT_WHITE, TFT_RED);
-    d.setCursor(x + 10, y + 4);
-    d.print("REC");
+    M5.Display.fillRoundRect(M5.Display.width() - 42, 4, 38, 14, 4, TFT_RED);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.setCursor(M5.Display.width() - 36, 7);
+    M5.Display.print("REC");
   }
 
-  d.setTextSize(1);
-  d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.setCursor(6, 18);
-  d.printf("BLE:%s ADV:%s", bleConnected ? "ON" : "OFF", bleAdvertising ? "ON" : "OFF");
+  // HR display
+  int hrDisp = (BPM > 0) ? BPM : ((millis() - lastValidBpmMs < HR_HOLD_MS) ? lastValidBpm : -1);
 
-  d.setCursor(6, 30);
-  d.printf("Name:%s", DEV_NAME);
+  M5.Display.setTextColor(TFT_YELLOW);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(6, 30);
+  if (hrDisp > 0) {
+    M5.Display.printf("HR: %d", hrDisp);
+  } else {
+    M5.Display.print("HR: --");
+  }
 
-  // ✅ Compute displayed HR same as your outgoing HR (hold-last)
-  uint32_t nowMs = millis();
-  int hrDisp = -1;
-  if (BPM > 0) hrDisp = BPM;
-  else if (lastValidBpm > 0 && (nowMs - lastValidBpmMs) <= HR_HOLD_MS) hrDisp = lastValidBpm;
+  // Accelerometer
+  M5.Display.setTextColor(TFT_WHITE);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(6, 65);  M5.Display.printf("AX: % .3f", ax);
+  M5.Display.setCursor(6, 77);  M5.Display.printf("AY: % .3f", ay);
+  M5.Display.setCursor(6, 89);  M5.Display.printf("AZ: % .3f", az);
 
-  // HR line
-  d.setTextSize(2);
-  d.setTextColor(TFT_YELLOW, TFT_BLACK);
-  d.setCursor(6, 48);
-  if (hrDisp > 0) d.printf("HR:%d", hrDisp);
-  else            d.print("HR:--");
+  M5.Display.setTextColor(TFT_CYAN);
+  M5.Display.setCursor(6, 110);
+  M5.Display.printf("Rows: %lu", (unsigned long)rowsWritten);
 
-  // Rows count
-  d.setTextSize(1);
-  d.setTextColor(TFT_CYAN, TFT_BLACK);
-  d.setCursor(6, 76);
-  d.printf("rows:%lu", (unsigned long)rowsWritten);
+  M5.Display.setTextColor(TFT_GREEN);
+  M5.Display.setCursor(6, 125);
+  M5.Display.print("A=REC  Bx2=OFF");
 
-  // ✅ Accel lines
-  d.setCursor(6, 92);
-  d.printf("ax:% .3f", ax);
-
-  d.setCursor(6, 104);
-  d.printf("ay:% .3f", ay);
-
-  d.setCursor(6, 116);
-  d.printf("az:% .3f", az);
-
-  d.endWrite();
+  M5.Display.endWrite();
 }
 
-// ----------------- Setup/Loop -----------------
-void setup() {
-  esp_log_level_set("task_wdt", ESP_LOG_NONE);
-  esp_task_wdt_deinit();
+// ----------------- Logging -----------------
+void startRecording() {
+  if (recording) return;
 
+  logFile = SPIFFS.open("/sleep_raw.csv", FILE_WRITE);
+  if (!logFile) {
+    Serial.println("[FILE] Failed to open /sleep_raw.csv");
+    return;
+  }
+
+  if (logFile.size() == 0) {
+    logFile.println("timestamp_ms,hr_bpm,acc_x,acc_y,acc_z");
+  }
+
+  recording = true;
+  rowsWritten = 0;
+  Serial.println("[REC] START");
+}
+
+void stopRecording() {
+  if (!recording) return;
+
+  if (logFile) {
+    logFile.flush();
+    logFile.close();
+  }
+
+  recording = false;
+  Serial.println("[REC] STOP");
+}
+
+// ----------------- Power Off -----------------
+void powerOffDevice() {
+  Serial.println("[PWR] Powering off...");
+
+  stopRecording();
+  stopSensor();
+
+  if (bleConnected && pTxCharacteristic) {
+    bleSendLine("POWERING_OFF");
+    delay(20);
+  }
+
+  bleStopAdvertising();
+
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextColor(TFT_WHITE);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(20, 50);
+  M5.Display.print("Power off");
+  delay(150);
+
+  // Real power-off request on StickC Plus2
+  digitalWrite(HOLD_PIN, LOW);
+
+  while (true) {
+    delay(1000);
+  }
+}
+
+// ----------------- Setup -----------------
+void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setRotation(3);
-  M5.Display.setBrightness(255);
-
   Serial.begin(115200);
-  delay(300);
-  Serial.println("Boot...");
 
-  if (!SPIFFS.begin(true)) Serial.println("[ERR] SPIFFS mount failed");
+  // Keep power held after wake on StickC Plus2
+  pinMode(HOLD_PIN, OUTPUT);
+  digitalWrite(HOLD_PIN, HIGH);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[SPIFFS] mount failed");
+  }
 
   imuOK = M5.Imu.begin();
-  if (!imuOK) Serial.println("[WARN] IMU init failed");
 
-  hasMAX = initMAX30102();
-  if (!hasMAX) Serial.println("[WARN] MAX30102 not found on I2C");
+  Wire.begin(SDA_PIN, SCL_PIN, I2C_HZ);
+
+  if (sensor.begin(Wire, I2C_HZ, MAX_ADDR)) {
+    hasMAX = true;
+    applyConfig();
+    Serial.println("[MAX3010x] OK");
+  } else {
+    hasMAX = false;
+    Serial.println("[MAX3010x] NOT FOUND");
+  }
 
   bleInit();
-  Serial.println("[INFO] Connect with phone app, enable Notify on TX char ...0003");
 }
 
+// ----------------- Loop -----------------
 void loop() {
   M5.update();
   blePollConnectionStatus();
 
-  // Buttons
+  // Button A = start/stop recording
   if (M5.BtnA.wasClicked()) {
     if (!recording) startRecording();
-    else            stopRecording();
-    delay(5);
+    else stopRecording();
   }
 
-  if (M5.BtnB.wasClicked()) {
-    if (!recording) dumpFileToSerial();
-    else {
-      static int mode = 0;
-      mode = (mode + 1) % 3;
-      int b = (mode == 0) ? 255 : (mode == 1 ? 96 : 0);
-      M5.Display.setBrightness(b);
-    }
-    delay(5);
+  // Button B double click = controlled shutdown
+  if (M5.BtnB.wasDoubleClicked()) {
+    powerOffDevice();
   }
 
-  // MAX30102 reading
-  static uint32_t ir = 0;
-  static uint32_t lastSampleMs = 0;
+  // Accel data
+  float ax = 0, ay = 0, az = 0;
+  if (imuOK) {
+    M5.Imu.getAccel(&ax, &ay, &az);
+  }
 
+  // Motion magnitude
+  float dAx = ax - lastAx;
+  float dAy = ay - lastAy;
+  float dAz = az - lastAz;
+  float deltaMag = sqrtf(dAx * dAx + dAy * dAy + dAz * dAz);
+  motionMag = MOTION_ALPHA * deltaMag + (1.0f - MOTION_ALPHA) * motionMag;
+  lastAx = ax;
+  lastAy = ay;
+  lastAz = az;
+
+  // Sensor data
+  uint32_t ir = 0;
   if (hasMAX) {
     sensor.check();
-    if (sensor.available()) {
-      ir = sensor.getIR();
-      sensor.nextSample();
-      lastSampleMs = millis();
-    } else {
-      if (millis() - lastSampleMs > 1500) {
-        Serial.println("[MAX] no samples -> recover");
-        sensor.clearFIFO();
-        applyConfig();
-        lastSampleMs = millis();
-      }
-    }
-  } else {
-    ir = 0;
+    ir = sensor.getIR();
+    autoLevel(ir, (ir > FINGER_MIN_IR));
   }
 
-  // Motion processing
-  float ax=0, ay=0, az=0;
-  if (imuOK) M5.Imu.getAccel(&ax,&ay,&az);
+  // Heart rate processing
+  if (hasMAX && ir > FINGER_MIN_IR && checkForBeat(ir)) {
+    unsigned long now = millis();
+    long delta = now - lastBeatMs;
 
-  float dAx = ax - lastAx, dAy = ay - lastAy, dAz = az - lastAz;
-  float deltaMag = sqrtf(dAx*dAx + dAy*dAy + dAz*dAz);
-  motionMag = MOTION_ALPHA*deltaMag + (1.0f - MOTION_ALPHA)*motionMag;
-  lastAx=ax; lastAy=ay; lastAz=az;
+    if (delta > IBI_MIN_MS && delta < IBI_MAX_MS) {
+      BPM = 60000 / delta;
+      lastValidBpm = BPM;
+      lastValidBpmMs = now;
+      lastBeatSeenMs = now;
+    }
 
-  // keep epoch accumulators (not used in output)
-  if (recording) {
-    if (deltaMag > MOTION_THRESH) epochActivityCount++;
-
-    accN++;
-    axSum += ax; aySum += ay; azSum += az;
-    ax2Sum += (double)ax*ax;
-    ay2Sum += (double)ay*ay;
-    az2Sum += (double)az*az;
-
-    float mag = sqrtf(ax*ax + ay*ay + az*az);
-    magSum += mag;
-    mag2Sum += (double)mag*mag;
+    lastBeatMs = now;
   }
 
-  // PPG processing
-  bool finger = fingerPresent(ir);
-  if (finger) lastFingerSeenMs = millis();
-  if (hasMAX) autoLevel(ir, finger);
-
-  if (hasMAX && finger) {
-    if (checkForBeat(ir)) {
-      unsigned long now = millis();
-      if (lastBeatMs != 0) {
-        unsigned long IBI = now - lastBeatMs;
-        if (IBI >= IBI_MIN_MS && IBI <= IBI_MAX_MS) {
-          float bpmInst = 60000.0f / (float)IBI;
-          if (bpmInst > 25.0f && bpmInst < 220.0f) {
-
-            rates[rateSpot++] = (byte)lroundf(bpmInst);
-            rateSpot %= RATE_SIZE;
-
-            int valid = 0, sum = 0;
-            for (byte i=0; i<RATE_SIZE; i++) {
-              if (rates[i] > 0) { sum += rates[i]; valid++; }
-            }
-            BPM = (valid >= 2) ? (sum / valid) : (int)lroundf(bpmInst);
-
-            // ✅ NEW: update last-valid HR immediately (no confidence gating)
-            if (BPM > 0) {
-              lastValidBpm = BPM;
-              lastValidBpmMs = now;
-
-              // also keep meanHR updated (optional, not used for output)
-              hrSum += (double)BPM;
-              hrCount++;
-              meanHR = hrSum / (double)hrCount;
-            }
-
-            lastBeatSeenMs = now;
-
-            // keep IBI + confidence for display (does not affect HR output)
-            if (ibiCount == 0) {
-              ibis[0] = IBI;
-              ibis[1] = IBI;
-              ibiPos = 2;
-              ibiCount = 2;
-            } else {
-              ibis[ibiPos] = IBI;
-              ibiPos = (ibiPos + 1) % IBI_BUF;
-              if (ibiCount < IBI_BUF) ibiCount++;
-            }
-
-            consecutiveBeats = min(consecutiveBeats + 1, 10);
-            int base = 20 + consecutiveBeats * 8;
-            int irPenalty = ((ir < IR_GOOD_MIN) || (ir > IR_GOOD_MAX)) ? 15 : 0;
-            int motionPenalty = (motionMag > 0.20f) ? 25 : 0;
-            confPct = base - irPenalty - motionPenalty;
-            confPct = constrain(confPct, 0, 100);
-          }
-        }
-      }
-      lastBeatMs = now;
-    }
-
-    if (lastBeatSeenMs == 0 || (millis() - lastBeatSeenMs) > NO_BEAT_TIMEOUT_MS) {
-      BPM = -1;
-      consecutiveBeats = 0;
-      confPct = 0;
-      resetIBI();
-    }
-  } else {
-    lastBeatMs = 0;
+  if (millis() - lastBeatSeenMs > NO_BEAT_TIMEOUT_MS) {
     BPM = -1;
-    consecutiveBeats = 0;
-    confPct = 0;
-    resetIBI();
   }
 
-  computeRMSSD();
+  // Logging + BLE
+  if (recording && (millis() - lastSendMs >= SAMPLE_SEND_PERIOD_MS)) {
+    lastSendMs = millis();
 
-  // Send raw sample rows while recording
-  if (recording) {
-    uint32_t nowMs = millis();
-    if (nowMs - lastSendMs >= SAMPLE_SEND_PERIOD_MS) {
-      lastSendMs = nowMs;
+    int hrOut = (BPM > 0) ? BPM : ((millis() - lastValidBpmMs < HR_HOLD_MS) ? lastValidBpm : -1);
 
-      // ✅ HR behaves like accel: hold last valid HR for HR_HOLD_MS
-      int hrOut = -1;
-      if (BPM > 0) {
-        hrOut = BPM;
-      } else if (lastValidBpm > 0 && (nowMs - lastValidBpmMs) <= HR_HOLD_MS) {
-        hrOut = lastValidBpm;
-      } else {
-        hrOut = -1;
-      }
+    if (logFile) {
+      logFile.printf("%lu,%d,%.5f,%.5f,%.5f\n", lastSendMs, hrOut, ax, ay, az);
+      logFile.flush();
+      rowsWritten++;
+    }
 
-      // BLE send
-      if (bleConnected) {
-        bleSendSample(nowMs, hrOut, ax, ay, az);
-      }
-
-      // File log
-      if (logFile) {
-        logFile.print(nowMs);
-        logFile.print(",");
-        logFile.print(hrOut);
-        logFile.print(",");
-        logFile.print(ax, 5);
-        logFile.print(",");
-        logFile.print(ay, 5);
-        logFile.print(",");
-        logFile.println(az, 5);
-        logFile.flush();
-        rowsWritten++;
-      }
+    if (bleConnected) {
+      bleSendSample(lastSendMs, hrOut, ax, ay, az);
     }
   }
 

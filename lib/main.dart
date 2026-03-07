@@ -10,6 +10,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'db.dart';
+import 'sadeh.dart';
 
 const nusServiceUuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 const nusTxUuid = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -18,6 +19,7 @@ void main() => runApp(const MyApp());
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -31,6 +33,7 @@ class MyApp extends StatelessWidget {
 
 class BleHome extends StatefulWidget {
   const BleHome({super.key});
+
   @override
   State<BleHome> createState() => _BleHomeState();
 }
@@ -53,9 +56,9 @@ class _BleHomeState extends State<BleHome> {
   int _dbRows = 0;
 
   Timer? _flushTimer;
-
-  // queue DB writes to prevent "database is locked"
   Future<void> _dbQueue = Future.value();
+
+  List<ScoredEpoch> _scoredEpochs = [];
 
   @override
   void initState() {
@@ -72,19 +75,23 @@ class _BleHomeState extends State<BleHome> {
     super.dispose();
   }
 
-  // ---------- BLE permissions ----------
   Future<bool> _ensureBlePermissions() async {
-    final loc = await Permission.locationWhenInUse.request();
-    if (!loc.isGranted) {
-      if (mounted) {
-        setState(() => _status = "Location permission denied (BLE scan needs it)");
+    if (Platform.isAndroid) {
+      final scan = await Permission.bluetoothScan.request();
+      final connect = await Permission.bluetoothConnect.request();
+      final loc = await Permission.locationWhenInUse.request();
+
+      final ok = scan.isGranted && connect.isGranted && loc.isGranted;
+
+      if (!ok && mounted) {
+        setState(() => _status = "BLE permissions denied");
       }
-      return false;
+      return ok;
     }
+
     return true;
   }
 
-  // ---------- BLE ----------
   Future<void> _startScan() async {
     final ok = await _ensureBlePermissions();
     if (!ok) return;
@@ -100,12 +107,15 @@ class _BleHomeState extends State<BleHome> {
       withServices: [Uuid.parse(nusServiceUuid)],
       scanMode: ScanMode.lowLatency,
     )
-        .listen((d) {
-      _found[d.id] = d;
-      if (mounted) setState(() {});
-    }, onError: (e) {
-      if (mounted) setState(() => _status = "Scan error: $e");
-    });
+        .listen(
+          (d) {
+        _found[d.id] = d;
+        if (mounted) setState(() {});
+      },
+      onError: (e) {
+        if (mounted) setState(() => _status = "Scan error: $e");
+      },
+    );
   }
 
   Future<void> _stopScan() async {
@@ -134,25 +144,30 @@ class _BleHomeState extends State<BleHome> {
       id: deviceId,
       connectionTimeout: const Duration(seconds: 12),
     )
-        .listen((update) async {
-      if (!mounted) return;
-      setState(() => _status = "Connection: ${update.connectionState}");
+        .listen(
+          (update) async {
+        if (!mounted) return;
 
-      if (update.connectionState == DeviceConnectionState.connected) {
-        _connectedId = deviceId;
-        await _subscribe(deviceId);
-      }
+        setState(() => _status = "Connection: ${update.connectionState}");
 
-      if (update.connectionState == DeviceConnectionState.disconnected) {
-        _connectedId = null;
-        await _notifySub?.cancel();
-        _notifySub = null;
-        _flushTimer?.cancel();
-        if (mounted) setState(() => _status = "Disconnected");
-      }
-    }, onError: (e) {
-      if (mounted) setState(() => _status = "Connect error: $e");
-    });
+        if (update.connectionState == DeviceConnectionState.connected) {
+          _connectedId = deviceId;
+          await _subscribe(deviceId);
+        }
+
+        if (update.connectionState == DeviceConnectionState.disconnected) {
+          await _flushPendingBufferNow();
+          _connectedId = null;
+          await _notifySub?.cancel();
+          _notifySub = null;
+          _flushTimer?.cancel();
+          if (mounted) setState(() => _status = "Disconnected");
+        }
+      },
+      onError: (e) {
+        if (mounted) setState(() => _status = "Connect error: $e");
+      },
+    );
   }
 
   Future<void> _subscribe(String deviceId) async {
@@ -163,16 +178,20 @@ class _BleHomeState extends State<BleHome> {
     );
 
     await _notifySub?.cancel();
-    _notifySub = _ble.subscribeToCharacteristic(c).listen((data) {
-      _handleIncoming(Uint8List.fromList(data));
-    }, onError: (e) {
-      if (mounted) setState(() => _status = "Notify error: $e");
-    });
+    _notifySub = _ble.subscribeToCharacteristic(c).listen(
+          (data) {
+        _handleIncoming(Uint8List.fromList(data));
+      },
+      onError: (e) {
+        if (mounted) setState(() => _status = "Notify error: $e");
+      },
+    );
 
-    if (mounted) setState(() => _status = "Subscribed ✅ (waiting for data)");
+    if (mounted) {
+      setState(() => _status = "Subscribed ✅ (waiting for data)");
+    }
   }
 
-  // ---------- Parse (timestamp_ms,hr_bpm,acc_x,acc_y,acc_z) ----------
   Map<String, dynamic>? _parseSample5(String line) {
     final parts = line.trim().split(',');
     if (parts.length != 5) return null;
@@ -186,7 +205,9 @@ class _BleHomeState extends State<BleHome> {
     final ay = toDouble(parts[3]);
     final az = toDouble(parts[4]);
 
-    if (t == null || hr == null || ax == null || ay == null || az == null) return null;
+    if (t == null || hr == null || ax == null || ay == null || az == null) {
+      return null;
+    }
 
     return {
       "timestamp_ms": t,
@@ -199,14 +220,15 @@ class _BleHomeState extends State<BleHome> {
 
   Future<void> _refreshDbRows() async {
     final c = await AppDb.countSamples();
-    if (mounted) setState(() => _dbRows = c);
+    if (mounted) {
+      setState(() => _dbRows = c);
+    }
   }
 
   Future<void> _commitLine(String line) async {
     final cleaned = line.trim();
     if (cleaned.isEmpty) return;
 
-    // show latest
     if (mounted) {
       setState(() {
         _lines.insert(0, cleaned);
@@ -215,10 +237,7 @@ class _BleHomeState extends State<BleHome> {
     }
 
     final parsed = _parseSample5(cleaned);
-    if (parsed == null) {
-      // ignore non-data lines like CONNECTED
-      return;
-    }
+    if (parsed == null) return;
 
     try {
       await AppDb.insertSample(
@@ -230,7 +249,9 @@ class _BleHomeState extends State<BleHome> {
         raw: cleaned,
       );
 
-      await _refreshDbRows();
+      if (mounted) {
+        setState(() => _dbRows++);
+      }
     } catch (e) {
       if (mounted) {
         setState(() => _status = "DB insert error: $e");
@@ -238,7 +259,6 @@ class _BleHomeState extends State<BleHome> {
     }
   }
 
-  // ---------- Incoming BLE bytes ----------
   void _handleIncoming(Uint8List bytes) {
     _bytesIn += bytes.length;
 
@@ -270,19 +290,32 @@ class _BleHomeState extends State<BleHome> {
     if (mounted) setState(() {});
   }
 
-  // ---------- Clear DB ----------
+  Future<void> _flushPendingBufferNow() async {
+    _flushTimer?.cancel();
+
+    final pending = _lineBuffer.toString().trim();
+    if (pending.isNotEmpty) {
+      _lineBuffer.clear();
+      _dbQueue = _dbQueue.then((_) => _commitLine(pending));
+    }
+
+    await _dbQueue;
+  }
+
   Future<void> _clearDatabase() async {
+    await _flushPendingBufferNow();
     await AppDb.clearAll();
-    await _refreshDbRows();
+
     if (!mounted) return;
     setState(() {
       _lines.clear();
+      _scoredEpochs.clear();
+      _dbRows = 0;
       _status = "Database cleared ✅";
     });
   }
 
-  // ---------- CSV Export (Share) ----------
-  String _buildCsv(List<Map<String, Object?>> rows) {
+  String _buildRawCsv(List<Map<String, Object?>> rows) {
     final sb = StringBuffer();
     sb.writeln("timestamp_ms,hr_bpm,acc_x,acc_y,acc_z");
 
@@ -295,20 +328,23 @@ class _BleHomeState extends State<BleHome> {
         r['acc_z'] ?? '',
       ].join(','));
     }
+
     return sb.toString();
   }
 
-  Future<void> _exportCsvToPhone() async {
+  Future<void> _exportRawCsvToPhone() async {
     try {
-      setState(() => _status = "Preparing CSV export...");
+      setState(() => _status = "Preparing raw CSV export...");
 
+      await _flushPendingBufferNow();
       final rows = await AppDb.getAllSamples();
+
       if (rows.isEmpty) {
-        setState(() => _status = "No data to export");
+        setState(() => _status = "No raw data to export");
         return;
       }
 
-      final csv = _buildCsv(rows);
+      final csv = _buildRawCsv(rows);
       final fileName = "sleep_raw_${DateTime.now().millisecondsSinceEpoch}.csv";
 
       final ext = await getExternalStorageDirectory();
@@ -321,16 +357,113 @@ class _BleHomeState extends State<BleHome> {
       await file.writeAsString(csv, flush: true);
 
       await Share.shareXFiles([XFile(file.path)], text: "Sleep raw CSV");
-      setState(() => _status = "Saved ✅ and shared:\n${file.path}");
+
+      if (mounted) {
+        setState(() => _status = "Raw CSV saved ✅\n${file.path}");
+      }
     } catch (e) {
-      setState(() => _status = "Export failed: $e");
+      if (mounted) {
+        setState(() => _status = "Raw export failed: $e");
+      }
     }
   }
 
-  // ---------- UI ----------
+  Future<void> _runSleepScoring() async {
+    try {
+      if (mounted) {
+        setState(() => _status = "Scoring sleep/wake...");
+      }
+
+      await _flushPendingBufferNow();
+      final rows = await AppDb.getAllSamples();
+
+      if (rows.isEmpty) {
+        if (mounted) setState(() => _status = "No samples available");
+        return;
+      }
+
+      final epochs = SleepScorer.scoreRows(rows, epochSeconds: 60);
+
+      if (!mounted) return;
+      setState(() {
+        _scoredEpochs = epochs;
+        _status = "Sleep scoring done ✅  Epochs: ${epochs.length}";
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() => _status = "Sleep scoring failed: $e");
+      }
+    }
+  }
+
+  String _buildScoredCsv(List<ScoredEpoch> epochs) {
+    final sb = StringBuffer();
+    sb.writeln("epoch_start_ms,epoch_end_ms,activity,mean_hr,label");
+
+    for (final e in epochs) {
+      sb.writeln([
+        e.startMs,
+        e.endMs,
+        e.activity.toStringAsFixed(6),
+        e.meanHr.toStringAsFixed(2),
+        e.isSleep ? "sleep" : "wake",
+      ].join(','));
+    }
+
+    return sb.toString();
+  }
+
+  Future<void> _exportScoredCsvToPhone() async {
+    try {
+      await _flushPendingBufferNow();
+
+      if (_scoredEpochs.isEmpty) {
+        await _runSleepScoring();
+      }
+
+      if (_scoredEpochs.isEmpty) {
+        if (mounted) setState(() => _status = "No scored epochs to export");
+        return;
+      }
+
+      if (mounted) {
+        setState(() => _status = "Preparing scored CSV export...");
+      }
+
+      final csv = _buildScoredCsv(_scoredEpochs);
+      final fileName =
+          "sleep_scored_${DateTime.now().millisecondsSinceEpoch}.csv";
+
+      final ext = await getExternalStorageDirectory();
+      if (ext == null) {
+        if (mounted) {
+          setState(() => _status = "Export failed: external storage not available");
+        }
+        return;
+      }
+
+      final file = File("${ext.path}/$fileName");
+      await file.writeAsString(csv, flush: true);
+
+      await Share.shareXFiles([XFile(file.path)], text: "Sleep scored CSV");
+
+      if (mounted) {
+        setState(() => _status = "Scored CSV saved ✅\n${file.path}");
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _status = "Scored export failed: $e");
+      }
+    }
+  }
+
+  int get _sleepCount => _scoredEpochs.where((e) => e.isSleep).length;
+  int get _wakeCount => _scoredEpochs.where((e) => !e.isSleep).length;
+
   @override
   Widget build(BuildContext context) {
-    final devices = _found.values.toList()..sort((a, b) => b.rssi.compareTo(a.rssi));
+    final devices = _found.values.toList()
+      ..sort((a, b) => b.rssi.compareTo(a.rssi));
 
     return Scaffold(
       appBar: AppBar(title: const Text("Sleep BLE Logger")),
@@ -343,15 +476,38 @@ class _BleHomeState extends State<BleHome> {
             const SizedBox(height: 6),
             Text("Bytes in: $_bytesIn"),
             Text("DB rows: $_dbRows"),
+            Text(
+              "Scored epochs: ${_scoredEpochs.length}   Sleep: $_sleepCount   Wake: $_wakeCount",
+            ),
             const SizedBox(height: 8),
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: [
-                ElevatedButton(onPressed: _startScan, child: const Text("Scan")),
-                ElevatedButton(onPressed: _stopScan, child: const Text("Stop")),
-                ElevatedButton(onPressed: _clearDatabase, child: const Text("Clear DB")),
-                ElevatedButton(onPressed: _exportCsvToPhone, child: const Text("Export CSV to Phone")),
+                ElevatedButton(
+                  onPressed: _startScan,
+                  child: const Text("Scan"),
+                ),
+                ElevatedButton(
+                  onPressed: _stopScan,
+                  child: const Text("Stop"),
+                ),
+                ElevatedButton(
+                  onPressed: _clearDatabase,
+                  child: const Text("Clear DB"),
+                ),
+                ElevatedButton(
+                  onPressed: _exportRawCsvToPhone,
+                  child: const Text("Export Raw CSV"),
+                ),
+                ElevatedButton(
+                  onPressed: _runSleepScoring,
+                  child: const Text("Score Sleep/Wake"),
+                ),
+                ElevatedButton(
+                  onPressed: _exportScoredCsvToPhone,
+                  child: const Text("Export Scored CSV"),
+                ),
               ],
             ),
             const SizedBox(height: 12),
@@ -367,8 +523,30 @@ class _BleHomeState extends State<BleHome> {
                     dense: true,
                     title: Text(name),
                     subtitle: Text("id: ${d.id}   rssi: ${d.rssi}"),
-                    trailing: _connectedId == d.id ? const Icon(Icons.check, color: Colors.green) : null,
+                    trailing: _connectedId == d.id
+                        ? const Icon(Icons.check, color: Colors.green)
+                        : null,
                     onTap: () => _connect(d.id),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text("Latest scored epochs:"),
+            SizedBox(
+              height: 140,
+              child: _scoredEpochs.isEmpty
+                  ? const Center(child: Text("No scored epochs yet"))
+                  : ListView.builder(
+                itemCount:
+                _scoredEpochs.length > 20 ? 20 : _scoredEpochs.length,
+                itemBuilder: (_, i) {
+                  final e = _scoredEpochs[i];
+                  return Text(
+                    "${e.startMs}  "
+                        "act=${e.activity.toStringAsFixed(3)}  "
+                        "hr=${e.meanHr.toStringAsFixed(1)}  "
+                        "${e.isSleep ? 'SLEEP' : 'WAKE'}",
                   );
                 },
               ),

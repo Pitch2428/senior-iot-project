@@ -1,17 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.blaze.sleep.sleep_ble_logger">
 
-    <!-- BLE hardware -->
     <uses-feature
         android:name="android.hardware.bluetooth_le"
         android:required="true" />
 
-    <!-- Legacy (Android 11 and below): BLE scan required location permission -->
+    <!-- Android 11 and below -->
     <uses-permission
         android:name="android.permission.ACCESS_FINE_LOCATION"
         android:maxSdkVersion="30" />
-
-    <!-- Legacy Bluetooth permissions (Android 11 and below) -->
     <uses-permission
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
@@ -19,17 +16,15 @@
         android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
 
-    <!-- Android 12+ Bluetooth runtime permissions -->
+    <!-- Android 12+ -->
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <!-- Not required unless your app advertises as a peripheral -->
-    <!-- <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" /> -->
 
     <application
-        android:label="sleep_ble_logger"
         android:name="${applicationName}"
+        android:label="sleep_ble_logger"
         android:icon="@mipmap/ic_launcher">
 
         <activity
