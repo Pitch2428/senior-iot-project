@@ -18,7 +18,7 @@ class AppDb {
 
     return openDatabase(
       path,
-      version: 4,
+      version: 6,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
         await db.rawQuery('PRAGMA journal_mode=WAL');
@@ -27,8 +27,59 @@ class AppDb {
         await _createTables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
-        if (oldVersion < 4) {
+        if (oldVersion < 6) {
           await _createTables(db);
+
+          if (oldVersion < 6) {
+            await db.execute('''
+              CREATE TABLE IF NOT EXISTS scored_epochs_new(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                epoch_start_ms INTEGER NOT NULL,
+                epoch_end_ms INTEGER NOT NULL,
+                activity REAL NOT NULL,
+                scaled_activity REAL NOT NULL,
+                conv_activity REAL NOT NULL,
+                mean_hr REAL NOT NULL,
+                sadeh_score REAL,
+                label TEXT NOT NULL
+              )
+            ''');
+
+            await db.execute('''
+              INSERT INTO scored_epochs_new(
+                id,
+                epoch_start_ms,
+                epoch_end_ms,
+                activity,
+                scaled_activity,
+                conv_activity,
+                mean_hr,
+                sadeh_score,
+                label
+              )
+              SELECT
+                id,
+                epoch_start_ms,
+                epoch_end_ms,
+                activity,
+                activity,
+                conv_activity,
+                mean_hr,
+                NULL,
+                label
+              FROM scored_epochs
+            ''');
+
+            await db.execute('DROP TABLE IF EXISTS scored_epochs');
+            await db.execute(
+              'ALTER TABLE scored_epochs_new RENAME TO scored_epochs',
+            );
+
+            await db.execute('''
+              CREATE INDEX IF NOT EXISTS idx_scored_epochs_start
+              ON scored_epochs(epoch_start_ms)
+            ''');
+          }
         }
       },
     );
@@ -50,6 +101,25 @@ class AppDb {
     await db.execute('''
       CREATE INDEX IF NOT EXISTS idx_samples_timestamp
       ON samples(timestamp_ms)
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS scored_epochs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        epoch_start_ms INTEGER NOT NULL,
+        epoch_end_ms INTEGER NOT NULL,
+        activity REAL NOT NULL,
+        scaled_activity REAL NOT NULL,
+        conv_activity REAL NOT NULL,
+        mean_hr REAL NOT NULL,
+        sadeh_score REAL,
+        label TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_scored_epochs_start
+      ON scored_epochs(epoch_start_ms)
     ''');
   }
 
@@ -77,9 +147,33 @@ class AppDb {
     );
   }
 
+  static Future<void> replaceScoredEpochs(
+      List<Map<String, Object?>> rows,
+      ) async {
+    final database = await db;
+
+    await database.transaction((txn) async {
+      await txn.delete('scored_epochs');
+
+      for (final row in rows) {
+        await txn.insert(
+          'scored_epochs',
+          row,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+    });
+  }
+
   static Future<int> countSamples() async {
     final database = await db;
     final res = await database.rawQuery('SELECT COUNT(*) FROM samples');
+    return Sqflite.firstIntValue(res) ?? 0;
+  }
+
+  static Future<int> countScoredEpochs() async {
+    final database = await db;
+    final res = await database.rawQuery('SELECT COUNT(*) FROM scored_epochs');
     return Sqflite.firstIntValue(res) ?? 0;
   }
 
@@ -87,7 +181,21 @@ class AppDb {
     final database = await db;
     await database.transaction((txn) async {
       await txn.delete('samples');
+      await txn.delete('scored_epochs');
       await txn.execute("DELETE FROM sqlite_sequence WHERE name = 'samples'");
+      await txn.execute(
+        "DELETE FROM sqlite_sequence WHERE name = 'scored_epochs'",
+      );
+    });
+  }
+
+  static Future<void> clearScoredEpochs() async {
+    final database = await db;
+    await database.transaction((txn) async {
+      await txn.delete('scored_epochs');
+      await txn.execute(
+        "DELETE FROM sqlite_sequence WHERE name = 'scored_epochs'",
+      );
     });
   }
 
@@ -96,6 +204,14 @@ class AppDb {
     return database.query(
       'samples',
       orderBy: 'timestamp_ms ASC',
+    );
+  }
+
+  static Future<List<Map<String, Object?>>> getAllScoredEpochs() async {
+    final database = await db;
+    return database.query(
+      'scored_epochs',
+      orderBy: 'epoch_start_ms ASC',
     );
   }
 

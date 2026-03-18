@@ -59,6 +59,10 @@ class _BleHomeState extends State<BleHome> {
   Future<void> _dbQueue = Future.value();
 
   List<ScoredEpoch> _scoredEpochs = [];
+  SleepMetrics? _metrics;
+
+  static const SleepAlgorithm _algorithm = SleepAlgorithm.sadehScaled;
+  static const double _activityScale = 5.0;
 
   @override
   void initState() {
@@ -310,6 +314,7 @@ class _BleHomeState extends State<BleHome> {
     setState(() {
       _lines.clear();
       _scoredEpochs.clear();
+      _metrics = null;
       _dbRows = 0;
       _status = "Database cleared ✅";
     });
@@ -328,6 +333,53 @@ class _BleHomeState extends State<BleHome> {
         r['acc_z'] ?? '',
       ].join(','));
     }
+
+    return sb.toString();
+  }
+
+  String _buildScoredCsv(List<ScoredEpoch> epochs) {
+    final sb = StringBuffer();
+    sb.writeln(
+      "epoch_start_ms,epoch_end_ms,activity,scaled_activity,conv_activity,mean_hr,sadeh_score,label",
+    );
+
+    for (final e in epochs) {
+      sb.writeln([
+        e.startMs,
+        e.endMs,
+        e.activity.toStringAsFixed(6),
+        e.scaledActivity.toStringAsFixed(6),
+        e.convolvedActivity.toStringAsFixed(6),
+        e.meanHr.toStringAsFixed(2),
+        e.sadehScore.isNaN ? '' : e.sadehScore.toStringAsFixed(6),
+        e.isSleep ? "sleep" : "wake",
+      ].join(','));
+    }
+
+    return sb.toString();
+  }
+
+  String _buildMetricsCsv(SleepMetrics? metrics) {
+    final sb = StringBuffer();
+    sb.writeln("metric,value");
+
+    if (metrics == null) return sb.toString();
+
+    sb.writeln(
+      "time_in_bed_minutes,${metrics.timeInBedMinutes.toStringAsFixed(2)}",
+    );
+    sb.writeln(
+      "total_sleep_time_minutes,${metrics.totalSleepTimeMinutes.toStringAsFixed(2)}",
+    );
+    sb.writeln("waso_minutes,${metrics.wasoMinutes.toStringAsFixed(2)}");
+    sb.writeln(
+      "sleep_latency_minutes,${metrics.sleepLatencyMinutes.toStringAsFixed(2)}",
+    );
+    sb.writeln(
+      "sleep_efficiency_percent,${metrics.sleepEfficiency.toStringAsFixed(2)}",
+    );
+    sb.writeln("sleep_onset_ms,${metrics.sleepOnsetMs ?? ''}");
+    sb.writeln("final_wake_ms,${metrics.finalWakeMs ?? ''}");
 
     return sb.toString();
   }
@@ -382,35 +434,41 @@ class _BleHomeState extends State<BleHome> {
         return;
       }
 
-      final epochs = SleepScorer.scoreRows(rows, epochSeconds: 60);
+      final epochs = SleepScorer.scoreRows(
+        rows,
+        epochSeconds: 30,
+        algorithm: _algorithm,
+        activityScale: _activityScale,
+      );
+      final metrics = SleepScorer.calculateMetrics(epochs);
+
+      await AppDb.replaceScoredEpochs(
+        epochs.map((e) {
+          return {
+            'epoch_start_ms': e.startMs,
+            'epoch_end_ms': e.endMs,
+            'activity': e.activity,
+            'scaled_activity': e.scaledActivity,
+            'conv_activity': e.convolvedActivity,
+            'mean_hr': e.meanHr,
+            'sadeh_score': e.sadehScore.isNaN ? null : e.sadehScore,
+            'label': e.isSleep ? 'sleep' : 'wake',
+          };
+        }).toList(),
+      );
 
       if (!mounted) return;
       setState(() {
         _scoredEpochs = epochs;
-        _status = "Sleep scoring done ✅  Epochs: ${epochs.length}";
+        _metrics = metrics;
+        _status =
+        "Sleep scoring done ✅  Epochs: ${epochs.length}  Algo: ${_algorithm.name}  Scale: ${_activityScale.toStringAsFixed(1)}";
       });
     } catch (e) {
       if (mounted) {
         setState(() => _status = "Sleep scoring failed: $e");
       }
     }
-  }
-
-  String _buildScoredCsv(List<ScoredEpoch> epochs) {
-    final sb = StringBuffer();
-    sb.writeln("epoch_start_ms,epoch_end_ms,activity,mean_hr,label");
-
-    for (final e in epochs) {
-      sb.writeln([
-        e.startMs,
-        e.endMs,
-        e.activity.toStringAsFixed(6),
-        e.meanHr.toStringAsFixed(2),
-        e.isSleep ? "sleep" : "wake",
-      ].join(','));
-    }
-
-    return sb.toString();
   }
 
   Future<void> _exportScoredCsvToPhone() async {
@@ -427,12 +485,15 @@ class _BleHomeState extends State<BleHome> {
       }
 
       if (mounted) {
-        setState(() => _status = "Preparing scored CSV export...");
+        setState(() => _status = "Preparing scored exports...");
       }
 
-      final csv = _buildScoredCsv(_scoredEpochs);
-      final fileName =
-          "sleep_scored_${DateTime.now().millisecondsSinceEpoch}.csv";
+      final scoredCsv = _buildScoredCsv(_scoredEpochs);
+      final metricsCsv = _buildMetricsCsv(_metrics);
+
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final scoredFileName = "sleep_scored_$now.csv";
+      final metricsFileName = "sleep_metrics_$now.csv";
 
       final ext = await getExternalStorageDirectory();
       if (ext == null) {
@@ -442,13 +503,25 @@ class _BleHomeState extends State<BleHome> {
         return;
       }
 
-      final file = File("${ext.path}/$fileName");
-      await file.writeAsString(csv, flush: true);
+      final scoredFile = File("${ext.path}/$scoredFileName");
+      final metricsFile = File("${ext.path}/$metricsFileName");
 
-      await Share.shareXFiles([XFile(file.path)], text: "Sleep scored CSV");
+      await scoredFile.writeAsString(scoredCsv, flush: true);
+      await metricsFile.writeAsString(metricsCsv, flush: true);
+
+      await Share.shareXFiles(
+        [
+          XFile(scoredFile.path),
+          XFile(metricsFile.path),
+        ],
+        text: "Sleep scored CSV and metrics CSV",
+      );
 
       if (mounted) {
-        setState(() => _status = "Scored CSV saved ✅\n${file.path}");
+        setState(() {
+          _status =
+          "Scored exports saved ✅\n${scoredFile.path}\n${metricsFile.path}";
+        });
       }
     } catch (e) {
       if (mounted) {
@@ -475,10 +548,24 @@ class _BleHomeState extends State<BleHome> {
             Text(_status),
             const SizedBox(height: 6),
             Text("Bytes in: $_bytesIn"),
-            Text("DB rows: $_dbRows"),
+            Text("Raw DB rows: $_dbRows"),
+            Text(
+              "Algorithm: ${_algorithm.name}   Scale: ${_activityScale.toStringAsFixed(1)}",
+            ),
             Text(
               "Scored epochs: ${_scoredEpochs.length}   Sleep: $_sleepCount   Wake: $_wakeCount",
             ),
+            if (_metrics != null)
+              Text(
+                "TIB: ${_metrics!.timeInBedMinutes.toStringAsFixed(1)} min   "
+                    "TST: ${_metrics!.totalSleepTimeMinutes.toStringAsFixed(1)} min",
+              ),
+            if (_metrics != null)
+              Text(
+                "WASO: ${_metrics!.wasoMinutes.toStringAsFixed(1)} min   "
+                    "Latency: ${_metrics!.sleepLatencyMinutes.toStringAsFixed(1)} min   "
+                    "SE: ${_metrics!.sleepEfficiency.toStringAsFixed(1)}%",
+              ),
             const SizedBox(height: 8),
             Wrap(
               spacing: 8,
@@ -534,7 +621,7 @@ class _BleHomeState extends State<BleHome> {
             const SizedBox(height: 12),
             const Text("Latest scored epochs:"),
             SizedBox(
-              height: 140,
+              height: 160,
               child: _scoredEpochs.isEmpty
                   ? const Center(child: Text("No scored epochs yet"))
                   : ListView.builder(
@@ -545,7 +632,9 @@ class _BleHomeState extends State<BleHome> {
                   return Text(
                     "${e.startMs}  "
                         "act=${e.activity.toStringAsFixed(3)}  "
-                        "hr=${e.meanHr.toStringAsFixed(1)}  "
+                        "scaled=${e.scaledActivity.toStringAsFixed(1)}  "
+                        "conv=${e.convolvedActivity.toStringAsFixed(3)}  "
+                        "score=${e.sadehScore.isNaN ? '-' : e.sadehScore.toStringAsFixed(3)}  "
                         "${e.isSleep ? 'SLEEP' : 'WAKE'}",
                   );
                 },
