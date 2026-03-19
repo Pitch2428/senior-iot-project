@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -31,6 +32,38 @@ class MyApp extends StatelessWidget {
   }
 }
 
+class _Raw5sBlockAccumulator {
+  final int blockStartMs;
+  final int blockEndMs;
+
+  int sampleCount = 0;
+  double hrSum = 0.0;
+  int hrCount = 0;
+  double activitySum = 0.0;
+
+  _Raw5sBlockAccumulator({
+    required this.blockStartMs,
+    required this.blockEndMs,
+  });
+
+  void addSample({
+    required int hrBpm,
+    required double activity,
+  }) {
+    sampleCount++;
+    activitySum += activity;
+
+    if (hrBpm >= 0) {
+      hrSum += hrBpm;
+      hrCount++;
+    }
+  }
+
+  double get meanHr => hrCount == 0 ? 0.0 : hrSum / hrCount;
+
+  double get activityMean => sampleCount == 0 ? 0.0 : activitySum / sampleCount;
+}
+
 class BleHome extends StatefulWidget {
   const BleHome({super.key});
 
@@ -56,6 +89,7 @@ class _BleHomeState extends State<BleHome> {
 
   int _bytesIn = 0;
   int _dbRows = 0;
+  int _raw5sBlockRows = 0;
 
   Timer? _flushTimer;
   Future<void> _dbQueue = Future.value();
@@ -63,8 +97,10 @@ class _BleHomeState extends State<BleHome> {
   List<ScoredEpoch> _scoredEpochs = [];
   SleepMetrics? _metrics;
 
-  static const SleepAlgorithm _algorithm = SleepAlgorithm.sadehScaled;
-  static const double _activityScale = 2.5;
+  _Raw5sBlockAccumulator? _current5sBlock;
+
+  static const SleepAlgorithm _algorithm = SleepAlgorithm.sadehScaledConvolved;
+  static const double _activityScale = 80.0;
 
   @override
   void initState() {
@@ -145,6 +181,7 @@ class _BleHomeState extends State<BleHome> {
       _bytesIn = 0;
       _lines.clear();
       _lineBuffer.clear();
+      _current5sBlock = null;
     });
 
     _flushTimer?.cancel();
@@ -169,6 +206,7 @@ class _BleHomeState extends State<BleHome> {
               startTimeMs: DateTime.now().millisecondsSinceEpoch,
             );
             _lastSessionId = _currentSessionId;
+            _current5sBlock = null;
           } catch (e) {
             if (mounted) {
               setState(() => _status = "Session start failed: $e");
@@ -180,6 +218,7 @@ class _BleHomeState extends State<BleHome> {
 
         if (update.connectionState == DeviceConnectionState.disconnected) {
           await _flushPendingBufferNow();
+          await _flushCurrent5sBlock();
 
           if (_currentSessionId != null) {
             await AppDb.endSession(
@@ -253,8 +292,85 @@ class _BleHomeState extends State<BleHome> {
 
   Future<void> _refreshDbRows() async {
     final c = await AppDb.countSamples();
+    final b = await AppDb.countRaw5sBlocks();
     if (mounted) {
-      setState(() => _dbRows = c);
+      setState(() {
+        _dbRows = c;
+        _raw5sBlockRows = b;
+      });
+    }
+  }
+
+  double _sampleActivity(double ax, double ay, double az) {
+    final vm = sqrt(ax * ax + ay * ay + az * az);
+    return (vm - 1.33).abs();
+  }
+
+  Future<void> _addSampleTo5sBlock({
+    required int sessionId,
+    required int timestampMs,
+    required int hrBpm,
+    required double accX,
+    required double accY,
+    required double accZ,
+  }) async {
+    final blockStartMs = (timestampMs ~/ 5000) * 5000;
+    final blockEndMs = blockStartMs + 5000;
+    final activity = _sampleActivity(accX, accY, accZ);
+
+    if (_current5sBlock == null) {
+      _current5sBlock = _Raw5sBlockAccumulator(
+        blockStartMs: blockStartMs,
+        blockEndMs: blockEndMs,
+      );
+    } else if (_current5sBlock!.blockStartMs != blockStartMs) {
+      await _flushCurrent5sBlock();
+      _current5sBlock = _Raw5sBlockAccumulator(
+        blockStartMs: blockStartMs,
+        blockEndMs: blockEndMs,
+      );
+    }
+
+    _current5sBlock!.addSample(
+      hrBpm: hrBpm,
+      activity: activity,
+    );
+  }
+
+  Future<void> _flushCurrent5sBlock() async {
+    final block = _current5sBlock;
+    final sessionId = _currentSessionId;
+
+    if (block == null || sessionId == null) {
+      _current5sBlock = null;
+      return;
+    }
+
+    if (block.sampleCount == 0) {
+      _current5sBlock = null;
+      return;
+    }
+
+    try {
+      await AppDb.insertRaw5sBlock(
+        sessionId: sessionId,
+        blockStartMs: block.blockStartMs,
+        blockEndMs: block.blockEndMs,
+        sampleCount: block.sampleCount,
+        meanHr: block.meanHr,
+        activitySum: block.activitySum,
+        activityMean: block.activityMean,
+      );
+
+      if (mounted) {
+        setState(() => _raw5sBlockRows++);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _status = "5s block insert error: $e");
+      }
+    } finally {
+      _current5sBlock = null;
     }
   }
 
@@ -282,6 +398,15 @@ class _BleHomeState extends State<BleHome> {
         accY: parsed["acc_y"] as double,
         accZ: parsed["acc_z"] as double,
         raw: cleaned,
+      );
+
+      await _addSampleTo5sBlock(
+        sessionId: _currentSessionId!,
+        timestampMs: parsed["timestamp_ms"] as int,
+        hrBpm: parsed["hr_bpm"] as int,
+        accX: parsed["acc_x"] as double,
+        accY: parsed["acc_y"] as double,
+        accZ: parsed["acc_z"] as double,
       );
 
       if (mounted) {
@@ -339,17 +464,36 @@ class _BleHomeState extends State<BleHome> {
 
   Future<void> _clearDatabase() async {
     await _flushPendingBufferNow();
+    await _flushCurrent5sBlock();
     await AppDb.clearAll();
+
+    int? newSessionId;
+
+    if (_connectedId != null) {
+      try {
+        newSessionId = await AppDb.startSession(
+          startTimeMs: DateTime.now().millisecondsSinceEpoch,
+        );
+      } catch (e) {
+        if (mounted) {
+          setState(() => _status = "Database cleared, but new session failed: $e");
+        }
+      }
+    }
 
     if (!mounted) return;
     setState(() {
       _lines.clear();
       _scoredEpochs.clear();
       _metrics = null;
-      _currentSessionId = null;
-      _lastSessionId = null;
+      _current5sBlock = null;
       _dbRows = 0;
-      _status = "Database cleared ✅";
+      _raw5sBlockRows = 0;
+      _currentSessionId = newSessionId;
+      _lastSessionId = newSessionId;
+      _status = newSessionId == null
+          ? "Database cleared ✅"
+          : "Database cleared ✅ New session started";
     });
   }
 
@@ -422,6 +566,7 @@ class _BleHomeState extends State<BleHome> {
       setState(() => _status = "Preparing raw CSV export...");
 
       await _flushPendingBufferNow();
+      await _flushCurrent5sBlock();
 
       final sessionId = _sessionToUse();
       if (sessionId == null) {
@@ -468,6 +613,7 @@ class _BleHomeState extends State<BleHome> {
       }
 
       await _flushPendingBufferNow();
+      await _flushCurrent5sBlock();
 
       final sessionId = _sessionToUse();
       if (sessionId == null) {
@@ -475,15 +621,15 @@ class _BleHomeState extends State<BleHome> {
         return;
       }
 
-      final rows = await AppDb.getSamplesForSession(sessionId);
+      final blocks = await AppDb.getRaw5sBlocksForSession(sessionId);
 
-      if (rows.isEmpty) {
-        if (mounted) setState(() => _status = "No samples in this session");
+      if (blocks.isEmpty) {
+        if (mounted) setState(() => _status = "No 5-second blocks in this session");
         return;
       }
 
-      final epochs = SleepScorer.scoreRows(
-        rows,
+      final epochs = SleepScorer.score5sBlocks(
+        blocks,
         epochSeconds: 30,
         algorithm: _algorithm,
         activityScale: _activityScale,
@@ -502,7 +648,8 @@ class _BleHomeState extends State<BleHome> {
       );
 
       await AppDb.replaceScoredEpochs(
-        epochs.map((e) {
+        sessionId: sessionId,
+        rows: epochs.map((e) {
           return {
             'epoch_start_ms': e.startMs,
             'epoch_end_ms': e.endMs,
@@ -533,31 +680,81 @@ class _BleHomeState extends State<BleHome> {
   Future<void> _exportScoredCsvToPhone() async {
     try {
       await _flushPendingBufferNow();
+      await _flushCurrent5sBlock();
 
-      if (_scoredEpochs.isEmpty) {
-        await _runSleepScoring();
+      final sessionId = _sessionToUse();
+      if (sessionId == null) {
+        if (mounted) setState(() => _status = "No session available");
+        return;
       }
 
-      if (_scoredEpochs.isEmpty) {
+      var scoredRows = await AppDb.getScoredEpochsForSession(sessionId);
+
+      if (scoredRows.isEmpty) {
+        await _runSleepScoring();
+        scoredRows = await AppDb.getScoredEpochsForSession(sessionId);
+      }
+
+      if (scoredRows.isEmpty) {
         if (mounted) setState(() => _status = "No scored epochs to export");
         return;
       }
 
-      if (mounted) {
-        setState(() => _status = "Preparing scored exports...");
+      final summaryRow = await AppDb.getSleepSummaryForSession(sessionId);
+
+      final epochs = scoredRows.map((r) {
+        final label = (r['label'] ?? '').toString();
+        final sadehRaw = r['sadeh_score'];
+
+        return ScoredEpoch(
+          startMs: (r['epoch_start_ms'] as num).toInt(),
+          endMs: (r['epoch_end_ms'] as num).toInt(),
+          activity: (r['activity'] as num).toDouble(),
+          scaledActivity: (r['scaled_activity'] as num).toDouble(),
+          convolvedActivity: (r['conv_activity'] as num).toDouble(),
+          meanHr: (r['mean_hr'] as num).toDouble(),
+          sadehScore: sadehRaw == null
+              ? double.nan
+              : (sadehRaw as num).toDouble(),
+          isSleep: label.toLowerCase() == 'sleep',
+        );
+      }).toList();
+
+      SleepMetrics? metrics;
+      if (summaryRow != null) {
+        metrics = SleepMetrics(
+          timeInBedMinutes:
+          ((summaryRow['time_in_bed_min'] as num?) ?? 0).toDouble(),
+          totalSleepTimeMinutes:
+          ((summaryRow['total_sleep_time_min'] as num?) ?? 0).toDouble(),
+          sleepLatencyMinutes:
+          ((summaryRow['sleep_latency_min'] as num?) ?? 0).toDouble(),
+          wasoMinutes: ((summaryRow['waso_min'] as num?) ?? 0).toDouble(),
+          sleepEfficiency:
+          ((summaryRow['sleep_efficiency_pct'] as num?) ?? 0).toDouble(),
+          sleepOnsetMs: summaryRow['sleep_onset_ms'] == null
+              ? null
+              : (summaryRow['sleep_onset_ms'] as num).toInt(),
+          finalWakeMs: summaryRow['final_wake_ms'] == null
+              ? null
+              : (summaryRow['final_wake_ms'] as num).toInt(),
+        );
       }
 
-      final sessionId = _sessionToUse();
-      final scoredCsv = _buildScoredCsv(_scoredEpochs);
-      final metricsCsv = _buildMetricsCsv(_metrics);
+      if (mounted) {
+        setState(() {
+          _scoredEpochs = epochs;
+          _metrics = metrics ?? _metrics;
+          _status = "Preparing scored exports...";
+        });
+      }
+
+      final scoredCsv = _buildScoredCsv(epochs);
+      final metricsCsv = _buildMetricsCsv(metrics ?? _metrics);
 
       final now = DateTime.now().millisecondsSinceEpoch;
-      final scoredFileName = sessionId == null
-          ? "sleep_scored_$now.csv"
-          : "sleep_scored_session_${sessionId}_$now.csv";
-      final metricsFileName = sessionId == null
-          ? "sleep_metrics_$now.csv"
-          : "sleep_metrics_session_${sessionId}_$now.csv";
+      final scoredFileName = "sleep_scored_session_${sessionId}_$now.csv";
+      final metricsFileName = "sleep_metrics_session_${sessionId}_$now.csv";
 
       final ext = await getExternalStorageDirectory();
       if (ext == null) {
@@ -613,6 +810,7 @@ class _BleHomeState extends State<BleHome> {
             const SizedBox(height: 6),
             Text("Bytes in: $_bytesIn"),
             Text("Raw DB rows: $_dbRows"),
+            Text("5s block rows: $_raw5sBlockRows"),
             Text(
               "Algorithm: ${_algorithm.name}   Scale: ${_activityScale.toStringAsFixed(1)}",
             ),

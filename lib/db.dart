@@ -18,7 +18,7 @@ class AppDb {
 
     return openDatabase(
       path,
-      version: 8,
+      version: 10,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
         await db.rawQuery('PRAGMA journal_mode=WAL');
@@ -30,13 +30,14 @@ class AppDb {
         await _createTables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
-        if (oldVersion < 8) {
+        if (oldVersion < 10) {
           await _createTables(db);
 
           if (oldVersion < 6) {
             await db.execute('''
               CREATE TABLE IF NOT EXISTS scored_epochs_new(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
                 epoch_start_ms INTEGER NOT NULL,
                 epoch_end_ms INTEGER NOT NULL,
                 activity REAL NOT NULL,
@@ -44,13 +45,15 @@ class AppDb {
                 conv_activity REAL NOT NULL,
                 mean_hr REAL NOT NULL,
                 sadeh_score REAL,
-                label TEXT NOT NULL
+                label TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
               )
             ''');
 
             await db.execute('''
               INSERT INTO scored_epochs_new(
                 id,
+                session_id,
                 epoch_start_ms,
                 epoch_end_ms,
                 activity,
@@ -62,6 +65,7 @@ class AppDb {
               )
               SELECT
                 id,
+                NULL,
                 epoch_start_ms,
                 epoch_end_ms,
                 activity,
@@ -79,8 +83,8 @@ class AppDb {
             );
 
             await db.execute('''
-              CREATE INDEX IF NOT EXISTS idx_scored_epochs_start
-              ON scored_epochs(epoch_start_ms)
+              CREATE INDEX IF NOT EXISTS idx_scored_epochs_session_start
+              ON scored_epochs(session_id, epoch_start_ms)
             ''');
           }
 
@@ -123,6 +127,90 @@ class AppDb {
               ON sleep_summaries(session_id)
             ''');
           }
+
+          if (oldVersion < 9) {
+            await db.execute('''
+              CREATE TABLE IF NOT EXISTS raw_5s_blocks(
+                block_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                block_start_ms INTEGER NOT NULL,
+                block_end_ms INTEGER NOT NULL,
+                sample_count INTEGER NOT NULL,
+                mean_hr REAL NOT NULL,
+                activity_sum REAL NOT NULL,
+                activity_mean REAL NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                UNIQUE(session_id, block_start_ms),
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+              )
+            ''');
+
+            await db.execute('''
+              CREATE INDEX IF NOT EXISTS idx_raw_5s_blocks_session_start
+              ON raw_5s_blocks(session_id, block_start_ms)
+            ''');
+          }
+
+          if (oldVersion < 10) {
+            final tableInfo = await db.rawQuery("PRAGMA table_info(scored_epochs)");
+            final hasSessionId =
+            tableInfo.any((row) => row['name'] == 'session_id');
+
+            if (!hasSessionId) {
+              await db.execute('''
+                CREATE TABLE IF NOT EXISTS scored_epochs_v10(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  session_id INTEGER,
+                  epoch_start_ms INTEGER NOT NULL,
+                  epoch_end_ms INTEGER NOT NULL,
+                  activity REAL NOT NULL,
+                  scaled_activity REAL NOT NULL,
+                  conv_activity REAL NOT NULL,
+                  mean_hr REAL NOT NULL,
+                  sadeh_score REAL,
+                  label TEXT NOT NULL,
+                  FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+                )
+              ''');
+
+              await db.execute('''
+                INSERT INTO scored_epochs_v10(
+                  id,
+                  session_id,
+                  epoch_start_ms,
+                  epoch_end_ms,
+                  activity,
+                  scaled_activity,
+                  conv_activity,
+                  mean_hr,
+                  sadeh_score,
+                  label
+                )
+                SELECT
+                  id,
+                  NULL,
+                  epoch_start_ms,
+                  epoch_end_ms,
+                  activity,
+                  scaled_activity,
+                  conv_activity,
+                  mean_hr,
+                  sadeh_score,
+                  label
+                FROM scored_epochs
+              ''');
+
+              await db.execute('DROP TABLE IF EXISTS scored_epochs');
+              await db.execute(
+                'ALTER TABLE scored_epochs_v10 RENAME TO scored_epochs',
+              );
+            }
+
+            await db.execute('''
+              CREATE INDEX IF NOT EXISTS idx_scored_epochs_session_start
+              ON scored_epochs(session_id, epoch_start_ms)
+            ''');
+          }
         }
       },
     );
@@ -151,9 +239,10 @@ class AppDb {
       )
     ''');
 
-    final tableInfo = await db.rawQuery("PRAGMA table_info(samples)");
-    final hasSessionId = tableInfo.any((row) => row['name'] == 'session_id');
-    if (!hasSessionId) {
+    final samplesInfo = await db.rawQuery("PRAGMA table_info(samples)");
+    final hasSamplesSessionId =
+    samplesInfo.any((row) => row['name'] == 'session_id');
+    if (!hasSamplesSessionId) {
       await db.execute('ALTER TABLE samples ADD COLUMN session_id INTEGER');
     }
 
@@ -168,8 +257,30 @@ class AppDb {
     ''');
 
     await db.execute('''
+      CREATE TABLE IF NOT EXISTS raw_5s_blocks(
+        block_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        block_start_ms INTEGER NOT NULL,
+        block_end_ms INTEGER NOT NULL,
+        sample_count INTEGER NOT NULL,
+        mean_hr REAL NOT NULL,
+        activity_sum REAL NOT NULL,
+        activity_mean REAL NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        UNIQUE(session_id, block_start_ms),
+        FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_raw_5s_blocks_session_start
+      ON raw_5s_blocks(session_id, block_start_ms)
+    ''');
+
+    await db.execute('''
       CREATE TABLE IF NOT EXISTS scored_epochs(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER,
         epoch_start_ms INTEGER NOT NULL,
         epoch_end_ms INTEGER NOT NULL,
         activity REAL NOT NULL,
@@ -177,13 +288,67 @@ class AppDb {
         conv_activity REAL NOT NULL,
         mean_hr REAL NOT NULL,
         sadeh_score REAL,
-        label TEXT NOT NULL
+        label TEXT NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES sessions(session_id)
       )
     ''');
 
+    final scoredInfo = await db.rawQuery("PRAGMA table_info(scored_epochs)");
+    final hasScoredSessionId =
+    scoredInfo.any((row) => row['name'] == 'session_id');
+    if (!hasScoredSessionId) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS scored_epochs_with_session(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id INTEGER,
+          epoch_start_ms INTEGER NOT NULL,
+          epoch_end_ms INTEGER NOT NULL,
+          activity REAL NOT NULL,
+          scaled_activity REAL NOT NULL,
+          conv_activity REAL NOT NULL,
+          mean_hr REAL NOT NULL,
+          sadeh_score REAL,
+          label TEXT NOT NULL,
+          FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+        )
+      ''');
+
+      await db.execute('''
+        INSERT INTO scored_epochs_with_session(
+          id,
+          session_id,
+          epoch_start_ms,
+          epoch_end_ms,
+          activity,
+          scaled_activity,
+          conv_activity,
+          mean_hr,
+          sadeh_score,
+          label
+        )
+        SELECT
+          id,
+          NULL,
+          epoch_start_ms,
+          epoch_end_ms,
+          activity,
+          scaled_activity,
+          conv_activity,
+          mean_hr,
+          sadeh_score,
+          label
+        FROM scored_epochs
+      ''');
+
+      await db.execute('DROP TABLE IF EXISTS scored_epochs');
+      await db.execute(
+        'ALTER TABLE scored_epochs_with_session RENAME TO scored_epochs',
+      );
+    }
+
     await db.execute('''
-      CREATE INDEX IF NOT EXISTS idx_scored_epochs_start
-      ON scored_epochs(epoch_start_ms)
+      CREATE INDEX IF NOT EXISTS idx_scored_epochs_session_start
+      ON scored_epochs(session_id, epoch_start_ms)
     ''');
 
     await db.execute('''
@@ -269,18 +434,53 @@ class AppDb {
     );
   }
 
-  static Future<void> replaceScoredEpochs(
-      List<Map<String, Object?>> rows,
-      ) async {
+  static Future<int> insertRaw5sBlock({
+    required int sessionId,
+    required int blockStartMs,
+    required int blockEndMs,
+    required int sampleCount,
+    required double meanHr,
+    required double activitySum,
+    required double activityMean,
+  }) async {
+    final database = await db;
+
+    return database.insert(
+      'raw_5s_blocks',
+      {
+        'session_id': sessionId,
+        'block_start_ms': blockStartMs,
+        'block_end_ms': blockEndMs,
+        'sample_count': sampleCount,
+        'mean_hr': meanHr,
+        'activity_sum': activitySum,
+        'activity_mean': activityMean,
+        'created_at_ms': DateTime.now().millisecondsSinceEpoch,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  static Future<void> replaceScoredEpochs({
+    required int sessionId,
+    required List<Map<String, Object?>> rows,
+  }) async {
     final database = await db;
 
     await database.transaction((txn) async {
-      await txn.delete('scored_epochs');
+      await txn.delete(
+        'scored_epochs',
+        where: 'session_id = ?',
+        whereArgs: [sessionId],
+      );
 
       for (final row in rows) {
         await txn.insert(
           'scored_epochs',
-          row,
+          {
+            'session_id': sessionId,
+            ...row,
+          },
           conflictAlgorithm: ConflictAlgorithm.replace,
         );
       }
@@ -343,9 +543,24 @@ class AppDb {
     return Sqflite.firstIntValue(res) ?? 0;
   }
 
+  static Future<int> countRaw5sBlocks() async {
+    final database = await db;
+    final res = await database.rawQuery('SELECT COUNT(*) FROM raw_5s_blocks');
+    return Sqflite.firstIntValue(res) ?? 0;
+  }
+
   static Future<int> countScoredEpochs() async {
     final database = await db;
     final res = await database.rawQuery('SELECT COUNT(*) FROM scored_epochs');
+    return Sqflite.firstIntValue(res) ?? 0;
+  }
+
+  static Future<int> countScoredEpochsForSession(int sessionId) async {
+    final database = await db;
+    final res = await database.rawQuery(
+      'SELECT COUNT(*) FROM scored_epochs WHERE session_id = ?',
+      [sessionId],
+    );
     return Sqflite.firstIntValue(res) ?? 0;
   }
 
@@ -353,10 +568,15 @@ class AppDb {
     final database = await db;
     await database.transaction((txn) async {
       await txn.delete('samples');
+      await txn.delete('raw_5s_blocks');
       await txn.delete('scored_epochs');
       await txn.delete('sleep_summaries');
       await txn.delete('sessions');
+
       await txn.execute("DELETE FROM sqlite_sequence WHERE name = 'samples'");
+      await txn.execute(
+        "DELETE FROM sqlite_sequence WHERE name = 'raw_5s_blocks'",
+      );
       await txn.execute(
         "DELETE FROM sqlite_sequence WHERE name = 'scored_epochs'",
       );
@@ -375,6 +595,15 @@ class AppDb {
         "DELETE FROM sqlite_sequence WHERE name = 'scored_epochs'",
       );
     });
+  }
+
+  static Future<void> clearScoredEpochsForSession(int sessionId) async {
+    final database = await db;
+    await database.delete(
+      'scored_epochs',
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
+    );
   }
 
   static Future<List<Map<String, Object?>>> getAllSamples() async {
@@ -397,10 +626,42 @@ class AppDb {
     );
   }
 
+  static Future<List<Map<String, Object?>>> getAllRaw5sBlocks() async {
+    final database = await db;
+    return database.query(
+      'raw_5s_blocks',
+      orderBy: 'block_start_ms ASC',
+    );
+  }
+
+  static Future<List<Map<String, Object?>>> getRaw5sBlocksForSession(
+      int sessionId,
+      ) async {
+    final database = await db;
+    return database.query(
+      'raw_5s_blocks',
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
+      orderBy: 'block_start_ms ASC',
+    );
+  }
+
   static Future<List<Map<String, Object?>>> getAllScoredEpochs() async {
     final database = await db;
     return database.query(
       'scored_epochs',
+      orderBy: 'session_id ASC, epoch_start_ms ASC',
+    );
+  }
+
+  static Future<List<Map<String, Object?>>> getScoredEpochsForSession(
+      int sessionId,
+      ) async {
+    final database = await db;
+    return database.query(
+      'scored_epochs',
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
       orderBy: 'epoch_start_ms ASC',
     );
   }

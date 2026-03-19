@@ -1,9 +1,9 @@
-//Sadeh is scaled to match IMU-derived activity range
 import 'dart:math';
 
 enum SleepAlgorithm {
   proxy,
   sadehScaled,
+  sadehScaledConvolved,
 }
 
 class ScoredEpoch {
@@ -62,6 +62,20 @@ class _EpochFeature {
   });
 }
 
+class _MotionThresholds {
+  final double lowAct;
+  final double highAct;
+  final double lowConv;
+  final double highConv;
+
+  const _MotionThresholds({
+    required this.lowAct,
+    required this.highAct,
+    required this.lowConv,
+    required this.highConv,
+  });
+}
+
 class SleepScorer {
   static List<ScoredEpoch> scoreRows(
       List<Map<String, Object?>> rows, {
@@ -79,6 +93,14 @@ class SleepScorer {
 
     final epochs = _buildEpochs(sorted, epochSeconds: epochSeconds);
     if (epochs.isEmpty) return [];
+
+    final motionThresholds =
+    algorithm == SleepAlgorithm.sadehScaledConvolved
+        ? _buildMotionThresholds(
+      epochs,
+      activityScale: activityScale,
+    )
+        : null;
 
     final out = <ScoredEpoch>[];
 
@@ -102,6 +124,106 @@ class SleepScorer {
             activityScale: activityScale,
           );
           isSleep = sadehScore >= 0.0;
+          break;
+
+        case SleepAlgorithm.sadehScaledConvolved:
+          sadehScore = _sadehScoreScaled(
+            epochs,
+            i,
+            activityScale: activityScale,
+          );
+          isSleep = _classifyEpochSadehConvolved(
+            epochs,
+            i,
+            sadehScore: sadehScore,
+            activityScale: activityScale,
+            thresholds: motionThresholds!,
+          );
+          break;
+      }
+
+      out.add(
+        ScoredEpoch(
+          startMs: current.startMs,
+          endMs: current.endMs,
+          activity: current.activity,
+          scaledActivity: scaledActivity,
+          convolvedActivity: conv,
+          meanHr: current.meanHr,
+          sadehScore: sadehScore,
+          isSleep: isSleep,
+        ),
+      );
+    }
+
+    return out.reversed.toList();
+  }
+
+  static List<ScoredEpoch> score5sBlocks(
+      List<Map<String, Object?>> blocks, {
+        int epochSeconds = 30,
+        SleepAlgorithm algorithm = SleepAlgorithm.proxy,
+        double activityScale = 10.0,
+      }) {
+    if (blocks.isEmpty) return [];
+
+    final sorted = List<Map<String, Object?>>.from(blocks)
+      ..sort(
+            (a, b) =>
+            (a['block_start_ms'] as int).compareTo(b['block_start_ms'] as int),
+      );
+
+    final epochs = _buildEpochsFrom5sBlocks(
+      sorted,
+      epochSeconds: epochSeconds,
+    );
+    if (epochs.isEmpty) return [];
+
+    final motionThresholds =
+    algorithm == SleepAlgorithm.sadehScaledConvolved
+        ? _buildMotionThresholds(
+      epochs,
+      activityScale: activityScale,
+    )
+        : null;
+
+    final out = <ScoredEpoch>[];
+
+    for (int i = 0; i < epochs.length; i++) {
+      final current = epochs[i];
+      final conv = _convolvedActivity(epochs, i);
+      final scaledActivity = current.activity * activityScale;
+
+      double sadehScore = double.nan;
+      bool isSleep;
+
+      switch (algorithm) {
+        case SleepAlgorithm.proxy:
+          isSleep = _classifyEpochProxy(epochs, i, conv);
+          break;
+
+        case SleepAlgorithm.sadehScaled:
+          sadehScore = _sadehScoreScaled(
+            epochs,
+            i,
+            activityScale: activityScale,
+          );
+          isSleep = sadehScore >= 0.0;
+          break;
+
+        case SleepAlgorithm.sadehScaledConvolved:
+          sadehScore = _sadehScoreScaled(
+            epochs,
+            i,
+            activityScale: activityScale,
+          );
+          isSleep = _classifyEpochSadehConvolved(
+            epochs,
+            i,
+            sadehScore: sadehScore,
+            activityScale: activityScale,
+            thresholds: motionThresholds!,
+          );
           break;
       }
 
@@ -226,6 +348,10 @@ class SleepScorer {
     int hrCount = 0;
     int sampleCount = 0;
 
+    double? lastAx;
+    double? lastAy;
+    double? lastAz;
+
     final out = <_EpochFeature>[];
 
     void flushEpoch() {
@@ -234,7 +360,7 @@ class SleepScorer {
         _EpochFeature(
           startMs: currentStart,
           endMs: currentEnd,
-          activity: activitySum,
+          activity: activitySum / sampleCount,
           meanHr: hrCount == 0 ? 0.0 : hrSum / hrCount,
         ),
       );
@@ -257,10 +383,19 @@ class SleepScorer {
         sampleCount = 0;
       }
 
-      final vm = sqrt(ax * ax + ay * ay + az * az);
-      final dynamicMotion = (vm - 1.33).abs();
+      double dynamicMotion = 0.0;
+      if (lastAx != null && lastAy != null && lastAz != null) {
+        final dx = ax - lastAx;
+        final dy = ay - lastAy;
+        final dz = az - lastAz;
+        dynamicMotion = sqrt(dx * dx + dy * dy + dz * dz);
+      }
 
       activitySum += dynamicMotion;
+
+      lastAx = ax;
+      lastAy = ay;
+      lastAz = az;
 
       if (hr >= 0) {
         hrSum += hr;
@@ -268,6 +403,78 @@ class SleepScorer {
       }
 
       sampleCount++;
+    }
+
+    flushEpoch();
+    return out;
+  }
+
+  static List<_EpochFeature> _buildEpochsFrom5sBlocks(
+      List<Map<String, Object?>> blocks, {
+        required int epochSeconds,
+      }) {
+    if (blocks.isEmpty) return [];
+
+    final epochMs = epochSeconds * 1000;
+    final firstTs = blocks.first['block_start_ms'] as int;
+
+    int currentStart = (firstTs ~/ epochMs) * epochMs;
+    int currentEnd = currentStart + epochMs;
+
+    double activityWeightedSum = 0.0;
+    int activitySampleCount = 0;
+
+    double hrWeightedSum = 0.0;
+    int hrSampleCount = 0;
+
+    int blockCount = 0;
+
+    final out = <_EpochFeature>[];
+
+    void flushEpoch() {
+      if (blockCount == 0) return;
+
+      out.add(
+        _EpochFeature(
+          startMs: currentStart,
+          endMs: currentEnd,
+          activity: activitySampleCount == 0
+              ? 0.0
+              : activityWeightedSum / activitySampleCount,
+          meanHr: hrSampleCount == 0 ? 0.0 : hrWeightedSum / hrSampleCount,
+        ),
+      );
+    }
+
+    for (final b in blocks) {
+      final blockStart = b['block_start_ms'] as int;
+      final sampleCount = (b['sample_count'] as num).toInt();
+      final meanHr = (b['mean_hr'] as num).toDouble();
+      final blockActivityMean = (b['activity_mean'] as num).toDouble();
+
+      while (blockStart >= currentEnd) {
+        flushEpoch();
+        currentStart = currentEnd;
+        currentEnd = currentStart + epochMs;
+
+        activityWeightedSum = 0.0;
+        activitySampleCount = 0;
+        hrWeightedSum = 0.0;
+        hrSampleCount = 0;
+        blockCount = 0;
+      }
+
+      if (sampleCount > 0) {
+        activityWeightedSum += blockActivityMean * sampleCount;
+        activitySampleCount += sampleCount;
+      }
+
+      if (sampleCount > 0 && meanHr >= 0) {
+        hrWeightedSum += meanHr * sampleCount;
+        hrSampleCount += sampleCount;
+      }
+
+      blockCount++;
     }
 
     flushEpoch();
@@ -310,6 +517,87 @@ class SleepScorer {
     }
 
     return lowMotion;
+  }
+
+  static bool _classifyEpochSadehConvolved(
+      List<_EpochFeature> epochs,
+      int i, {
+        required double sadehScore,
+        required double activityScale,
+        required _MotionThresholds thresholds,
+      }) {
+    final scaledActivity = _scaledActivityAt(
+      epochs,
+      i,
+      activityScale: activityScale,
+    );
+
+    final scaledConv = _convolvedActivity(epochs, i) * activityScale;
+
+    if (sadehScore < 0.0) {
+      return false;
+    }
+
+    if (scaledActivity <= thresholds.lowAct &&
+        scaledConv <= thresholds.lowConv) {
+      return true;
+    }
+
+    if (scaledActivity >= thresholds.highAct ||
+        scaledConv >= thresholds.highConv) {
+      return false;
+    }
+
+    final midAct = (thresholds.lowAct + thresholds.highAct) / 2.0;
+    final midConv = (thresholds.lowConv + thresholds.highConv) / 2.0;
+
+    return sadehScore >= 1.0 &&
+        scaledActivity <= midAct &&
+        scaledConv <= midConv;
+  }
+
+  static _MotionThresholds _buildMotionThresholds(
+      List<_EpochFeature> epochs, {
+        required double activityScale,
+      }) {
+    final acts = <double>[];
+    final convs = <double>[];
+
+    for (int i = 0; i < epochs.length; i++) {
+      acts.add(
+        _scaledActivityAt(
+          epochs,
+          i,
+          activityScale: activityScale,
+        ),
+      );
+      convs.add(_convolvedActivity(epochs, i) * activityScale);
+    }
+
+    final lowAct = _percentile(acts, 0.35);
+    final highAct = _percentile(acts, 0.65);
+    final lowConv = _percentile(convs, 0.35);
+    final highConv = _percentile(convs, 0.65);
+
+    return _MotionThresholds(
+      lowAct: lowAct,
+      highAct: highAct,
+      lowConv: lowConv,
+      highConv: highConv,
+    );
+  }
+
+  static double _percentile(List<double> values, double p) {
+    if (values.isEmpty) return 0.0;
+
+    final sorted = List<double>.from(values)..sort();
+    final rawIndex = ((sorted.length - 1) * p).round();
+
+    int index = rawIndex;
+    if (index < 0) index = 0;
+    if (index >= sorted.length) index = sorted.length - 1;
+
+    return sorted[index];
   }
 
   static double _scaledActivityAt(
