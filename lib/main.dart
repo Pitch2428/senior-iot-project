@@ -51,6 +51,8 @@ class _BleHomeState extends State<BleHome> {
 
   String _status = "Idle";
   String? _connectedId;
+  int? _currentSessionId;
+  int? _lastSessionId;
 
   int _bytesIn = 0;
   int _dbRows = 0;
@@ -62,7 +64,7 @@ class _BleHomeState extends State<BleHome> {
   SleepMetrics? _metrics;
 
   static const SleepAlgorithm _algorithm = SleepAlgorithm.sadehScaled;
-  static const double _activityScale = 5.0;
+  static const double _activityScale = 2.5;
 
   @override
   void initState() {
@@ -77,6 +79,10 @@ class _BleHomeState extends State<BleHome> {
     _notifySub?.cancel();
     _flushTimer?.cancel();
     super.dispose();
+  }
+
+  int? _sessionToUse() {
+    return _currentSessionId ?? _lastSessionId;
   }
 
   Future<bool> _ensureBlePermissions() async {
@@ -135,6 +141,7 @@ class _BleHomeState extends State<BleHome> {
     setState(() {
       _status = "Connecting...";
       _connectedId = null;
+      _currentSessionId = null;
       _bytesIn = 0;
       _lines.clear();
       _lineBuffer.clear();
@@ -156,11 +163,33 @@ class _BleHomeState extends State<BleHome> {
 
         if (update.connectionState == DeviceConnectionState.connected) {
           _connectedId = deviceId;
+
+          try {
+            _currentSessionId = await AppDb.startSession(
+              startTimeMs: DateTime.now().millisecondsSinceEpoch,
+            );
+            _lastSessionId = _currentSessionId;
+          } catch (e) {
+            if (mounted) {
+              setState(() => _status = "Session start failed: $e");
+            }
+          }
+
           await _subscribe(deviceId);
         }
 
         if (update.connectionState == DeviceConnectionState.disconnected) {
           await _flushPendingBufferNow();
+
+          if (_currentSessionId != null) {
+            await AppDb.endSession(
+              sessionId: _currentSessionId!,
+              endTimeMs: DateTime.now().millisecondsSinceEpoch,
+            );
+            _lastSessionId = _currentSessionId;
+          }
+          _currentSessionId = null;
+
           _connectedId = null;
           await _notifySub?.cancel();
           _notifySub = null;
@@ -242,9 +271,11 @@ class _BleHomeState extends State<BleHome> {
 
     final parsed = _parseSample5(cleaned);
     if (parsed == null) return;
+    if (_currentSessionId == null) return;
 
     try {
       await AppDb.insertSample(
+        sessionId: _currentSessionId!,
         timestampMs: parsed["timestamp_ms"] as int,
         hrBpm: parsed["hr_bpm"] as int,
         accX: parsed["acc_x"] as double,
@@ -315,6 +346,8 @@ class _BleHomeState extends State<BleHome> {
       _lines.clear();
       _scoredEpochs.clear();
       _metrics = null;
+      _currentSessionId = null;
+      _lastSessionId = null;
       _dbRows = 0;
       _status = "Database cleared ✅";
     });
@@ -389,15 +422,23 @@ class _BleHomeState extends State<BleHome> {
       setState(() => _status = "Preparing raw CSV export...");
 
       await _flushPendingBufferNow();
-      final rows = await AppDb.getAllSamples();
+
+      final sessionId = _sessionToUse();
+      if (sessionId == null) {
+        setState(() => _status = "No session available");
+        return;
+      }
+
+      final rows = await AppDb.getSamplesForSession(sessionId);
 
       if (rows.isEmpty) {
-        setState(() => _status = "No raw data to export");
+        setState(() => _status = "No raw data in this session");
         return;
       }
 
       final csv = _buildRawCsv(rows);
-      final fileName = "sleep_raw_${DateTime.now().millisecondsSinceEpoch}.csv";
+      final fileName =
+          "sleep_raw_session_${sessionId}_${DateTime.now().millisecondsSinceEpoch}.csv";
 
       final ext = await getExternalStorageDirectory();
       if (ext == null) {
@@ -427,10 +468,17 @@ class _BleHomeState extends State<BleHome> {
       }
 
       await _flushPendingBufferNow();
-      final rows = await AppDb.getAllSamples();
+
+      final sessionId = _sessionToUse();
+      if (sessionId == null) {
+        if (mounted) setState(() => _status = "No session available");
+        return;
+      }
+
+      final rows = await AppDb.getSamplesForSession(sessionId);
 
       if (rows.isEmpty) {
-        if (mounted) setState(() => _status = "No samples available");
+        if (mounted) setState(() => _status = "No samples in this session");
         return;
       }
 
@@ -441,6 +489,17 @@ class _BleHomeState extends State<BleHome> {
         activityScale: _activityScale,
       );
       final metrics = SleepScorer.calculateMetrics(epochs);
+
+      await AppDb.upsertSleepSummary(
+        sessionId: sessionId,
+        timeInBedMin: metrics.timeInBedMinutes,
+        totalSleepTimeMin: metrics.totalSleepTimeMinutes,
+        sleepLatencyMin: metrics.sleepLatencyMinutes,
+        wasoMin: metrics.wasoMinutes,
+        sleepEfficiencyPct: metrics.sleepEfficiency,
+        sleepOnsetMs: metrics.sleepOnsetMs,
+        finalWakeMs: metrics.finalWakeMs,
+      );
 
       await AppDb.replaceScoredEpochs(
         epochs.map((e) {
@@ -462,7 +521,7 @@ class _BleHomeState extends State<BleHome> {
         _scoredEpochs = epochs;
         _metrics = metrics;
         _status =
-        "Sleep scoring done ✅  Epochs: ${epochs.length}  Algo: ${_algorithm.name}  Scale: ${_activityScale.toStringAsFixed(1)}";
+        "Sleep scoring done ✅  Session: $sessionId  Epochs: ${epochs.length}";
       });
     } catch (e) {
       if (mounted) {
@@ -488,12 +547,17 @@ class _BleHomeState extends State<BleHome> {
         setState(() => _status = "Preparing scored exports...");
       }
 
+      final sessionId = _sessionToUse();
       final scoredCsv = _buildScoredCsv(_scoredEpochs);
       final metricsCsv = _buildMetricsCsv(_metrics);
 
       final now = DateTime.now().millisecondsSinceEpoch;
-      final scoredFileName = "sleep_scored_$now.csv";
-      final metricsFileName = "sleep_metrics_$now.csv";
+      final scoredFileName = sessionId == null
+          ? "sleep_scored_$now.csv"
+          : "sleep_scored_session_${sessionId}_$now.csv";
+      final metricsFileName = sessionId == null
+          ? "sleep_metrics_$now.csv"
+          : "sleep_metrics_session_${sessionId}_$now.csv";
 
       final ext = await getExternalStorageDirectory();
       if (ext == null) {

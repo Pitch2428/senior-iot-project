@@ -18,7 +18,7 @@ class AppDb {
 
     return openDatabase(
       path,
-      version: 6,
+      version: 8,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
         await db.rawQuery('PRAGMA journal_mode=WAL');
@@ -26,8 +26,11 @@ class AppDb {
       onCreate: (db, version) async {
         await _createTables(db);
       },
+      onOpen: (db) async {
+        await _createTables(db);
+      },
       onUpgrade: (db, oldVersion, newVersion) async {
-        if (oldVersion < 6) {
+        if (oldVersion < 8) {
           await _createTables(db);
 
           if (oldVersion < 6) {
@@ -80,6 +83,46 @@ class AppDb {
               ON scored_epochs(epoch_start_ms)
             ''');
           }
+
+          if (oldVersion < 7) {
+            final tableInfo = await db.rawQuery("PRAGMA table_info(samples)");
+            final hasSessionId =
+            tableInfo.any((row) => row['name'] == 'session_id');
+
+            if (!hasSessionId) {
+              await db.execute(
+                'ALTER TABLE samples ADD COLUMN session_id INTEGER',
+              );
+            }
+
+            await db.execute('''
+              CREATE INDEX IF NOT EXISTS idx_samples_session_timestamp
+              ON samples(session_id, timestamp_ms)
+            ''');
+          }
+
+          if (oldVersion < 8) {
+            await db.execute('''
+              CREATE TABLE IF NOT EXISTS sleep_summaries(
+                summary_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL UNIQUE,
+                time_in_bed_min REAL,
+                total_sleep_time_min REAL,
+                sleep_latency_min REAL,
+                waso_min REAL,
+                sleep_efficiency_pct REAL,
+                sleep_onset_ms INTEGER,
+                final_wake_ms INTEGER,
+                generated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+              )
+            ''');
+
+            await db.execute('''
+              CREATE INDEX IF NOT EXISTS idx_sleep_summaries_session
+              ON sleep_summaries(session_id)
+            ''');
+          }
         }
       },
     );
@@ -87,20 +130,41 @@ class AppDb {
 
   static Future<void> _createTables(Database db) async {
     await db.execute('''
+      CREATE TABLE IF NOT EXISTS sessions(
+        session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        start_time_ms INTEGER NOT NULL,
+        end_time_ms INTEGER
+      )
+    ''');
+
+    await db.execute('''
       CREATE TABLE IF NOT EXISTS samples(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER,
         timestamp_ms INTEGER NOT NULL,
         hr_bpm INTEGER NOT NULL,
         acc_x REAL NOT NULL,
         acc_y REAL NOT NULL,
         acc_z REAL NOT NULL,
-        raw TEXT
+        raw TEXT,
+        FOREIGN KEY(session_id) REFERENCES sessions(session_id)
       )
     ''');
+
+    final tableInfo = await db.rawQuery("PRAGMA table_info(samples)");
+    final hasSessionId = tableInfo.any((row) => row['name'] == 'session_id');
+    if (!hasSessionId) {
+      await db.execute('ALTER TABLE samples ADD COLUMN session_id INTEGER');
+    }
 
     await db.execute('''
       CREATE INDEX IF NOT EXISTS idx_samples_timestamp
       ON samples(timestamp_ms)
+    ''');
+
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_samples_session_timestamp
+      ON samples(session_id, timestamp_ms)
     ''');
 
     await db.execute('''
@@ -121,9 +185,66 @@ class AppDb {
       CREATE INDEX IF NOT EXISTS idx_scored_epochs_start
       ON scored_epochs(epoch_start_ms)
     ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sleep_summaries(
+        summary_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL UNIQUE,
+        time_in_bed_min REAL,
+        total_sleep_time_min REAL,
+        sleep_latency_min REAL,
+        waso_min REAL,
+        sleep_efficiency_pct REAL,
+        sleep_onset_ms INTEGER,
+        final_wake_ms INTEGER,
+        generated_at_ms INTEGER NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_sleep_summaries_session
+      ON sleep_summaries(session_id)
+    ''');
+  }
+
+  static Future<int> startSession({
+    required int startTimeMs,
+  }) async {
+    final database = await db;
+
+    print('Starting session at $startTimeMs');
+
+    final id = await database.insert(
+      'sessions',
+      {
+        'start_time_ms': startTimeMs,
+        'end_time_ms': null,
+      },
+      conflictAlgorithm: ConflictAlgorithm.abort,
+    );
+
+    print('Session started: $id');
+    return id;
+  }
+
+  static Future<void> endSession({
+    required int sessionId,
+    required int endTimeMs,
+  }) async {
+    final database = await db;
+    await database.update(
+      'sessions',
+      {
+        'end_time_ms': endTimeMs,
+      },
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
+    );
   }
 
   static Future<int> insertSample({
+    required int sessionId,
     required int timestampMs,
     required int hrBpm,
     required double accX,
@@ -136,6 +257,7 @@ class AppDb {
     return database.insert(
       'samples',
       {
+        'session_id': sessionId,
         'timestamp_ms': timestampMs,
         'hr_bpm': hrBpm,
         'acc_x': accX,
@@ -165,6 +287,56 @@ class AppDb {
     });
   }
 
+  static Future<void> upsertSleepSummary({
+    required int sessionId,
+    required double timeInBedMin,
+    required double totalSleepTimeMin,
+    required double sleepLatencyMin,
+    required double wasoMin,
+    required double sleepEfficiencyPct,
+    required int? sleepOnsetMs,
+    required int? finalWakeMs,
+  }) async {
+    final database = await db;
+
+    await database.insert(
+      'sleep_summaries',
+      {
+        'session_id': sessionId,
+        'time_in_bed_min': timeInBedMin,
+        'total_sleep_time_min': totalSleepTimeMin,
+        'sleep_latency_min': sleepLatencyMin,
+        'waso_min': wasoMin,
+        'sleep_efficiency_pct': sleepEfficiencyPct,
+        'sleep_onset_ms': sleepOnsetMs,
+        'final_wake_ms': finalWakeMs,
+        'generated_at_ms': DateTime.now().millisecondsSinceEpoch,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  static Future<Map<String, Object?>?> getSleepSummaryForSession(
+      int sessionId,
+      ) async {
+    final database = await db;
+    final rows = await database.query(
+      'sleep_summaries',
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first;
+  }
+
+  static Future<List<Map<String, Object?>>> getAllSleepSummaries() async {
+    final database = await db;
+    return database.query(
+      'sleep_summaries',
+      orderBy: 'generated_at_ms DESC',
+    );
+  }
+
   static Future<int> countSamples() async {
     final database = await db;
     final res = await database.rawQuery('SELECT COUNT(*) FROM samples');
@@ -182,10 +354,16 @@ class AppDb {
     await database.transaction((txn) async {
       await txn.delete('samples');
       await txn.delete('scored_epochs');
+      await txn.delete('sleep_summaries');
+      await txn.delete('sessions');
       await txn.execute("DELETE FROM sqlite_sequence WHERE name = 'samples'");
       await txn.execute(
         "DELETE FROM sqlite_sequence WHERE name = 'scored_epochs'",
       );
+      await txn.execute(
+        "DELETE FROM sqlite_sequence WHERE name = 'sleep_summaries'",
+      );
+      await txn.execute("DELETE FROM sqlite_sequence WHERE name = 'sessions'");
     });
   }
 
@@ -203,6 +381,18 @@ class AppDb {
     final database = await db;
     return database.query(
       'samples',
+      orderBy: 'timestamp_ms ASC',
+    );
+  }
+
+  static Future<List<Map<String, Object?>>> getSamplesForSession(
+      int sessionId,
+      ) async {
+    final database = await db;
+    return database.query(
+      'samples',
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
       orderBy: 'timestamp_ms ASC',
     );
   }

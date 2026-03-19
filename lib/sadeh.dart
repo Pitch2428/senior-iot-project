@@ -258,7 +258,7 @@ class SleepScorer {
       }
 
       final vm = sqrt(ax * ax + ay * ay + az * az);
-      final dynamicMotion = (vm - 1.0).abs();
+      final dynamicMotion = (vm - 1.33).abs();
 
       activitySum += dynamicMotion;
 
