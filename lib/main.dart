@@ -100,7 +100,7 @@ class _BleHomeState extends State<BleHome> {
   _Raw5sBlockAccumulator? _current5sBlock;
 
   static const SleepAlgorithm _algorithm = SleepAlgorithm.sadehScaledConvolved;
-  static const double _activityScale = 80.0;
+  static const double _activityScale = 50.0;
 
   @override
   void initState() {
