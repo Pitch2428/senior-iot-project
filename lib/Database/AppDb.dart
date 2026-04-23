@@ -18,7 +18,7 @@ class AppDb {
 
     return openDatabase(
       path,
-      version: 11, 
+      version: 13, // CHANGED: Incremented to version 13
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
         await db.rawQuery('PRAGMA journal_mode=WAL');
@@ -147,7 +147,6 @@ class AppDb {
           }
         }
 
-        // --- Migration to Version 11 ---
         if (oldVersion < 11) {
           final tableInfo = await db.rawQuery("PRAGMA table_info(sleep_summaries)");
           final requiredColumns = {
@@ -165,8 +164,49 @@ class AppDb {
             }
           }
         }
+
+        if (oldVersion < 12) {
+          final tableInfo = await db.rawQuery("PRAGMA table_info(sleep_summaries)");
+          final hasSleepScore = tableInfo.any((row) => row['name'] == 'sleep_score');
+          if (!hasSleepScore) {
+            await db.execute('ALTER TABLE sleep_summaries ADD COLUMN sleep_score REAL');
+          }
+        }
+
+        // NEW: Version 13 - No schema changes, just for retention cleanup
+        if (oldVersion < 13) {
+          // Clean up old data when upgrading to version 13
+          await _cleanupOldData(db);
+        }
       },
     );
+  }
+
+  // NEW: Clean up old data (keep last 14 days)
+  static Future<void> _cleanupOldData(Database db) async {
+    final cutoffTime = DateTime.now().subtract(const Duration(days: 14)).millisecondsSinceEpoch;
+    
+    // Get sessions older than 14 days
+    final oldSessions = await db.query(
+      'sessions',
+      where: 'start_time_ms < ?',
+      whereArgs: [cutoffTime],
+    );
+    
+    for (final session in oldSessions) {
+      final sessionId = session['session_id'] as int;
+      await db.transaction((txn) async {
+        await txn.delete('samples', where: 'session_id = ?', whereArgs: [sessionId]);
+        await txn.delete('raw_5s_blocks', where: 'session_id = ?', whereArgs: [sessionId]);
+        await txn.delete('scored_epochs', where: 'session_id = ?', whereArgs: [sessionId]);
+        await txn.delete('sleep_summaries', where: 'session_id = ?', whereArgs: [sessionId]);
+        await txn.delete('sessions', where: 'session_id = ?', whereArgs: [sessionId]);
+      });
+    }
+    
+    if (oldSessions.isNotEmpty) {
+      print('🧹 Cleaned up ${oldSessions.length} old sessions (>14 days)');
+    }
   }
 
   static Future<void> _createTables(Database db) async {
@@ -247,6 +287,7 @@ class AppDb {
         sleep_efficiency_pct REAL,
         sleep_onset_ms INTEGER,
         final_wake_ms INTEGER,
+        sleep_score REAL,
         generated_at_ms INTEGER NOT NULL,
         FOREIGN KEY(session_id) REFERENCES sessions(session_id)
       )
@@ -255,7 +296,93 @@ class AppDb {
     await db.execute('CREATE INDEX IF NOT EXISTS idx_sleep_summaries_session ON sleep_summaries(session_id)');
   }
 
-  // --- RESTORED HELPER METHODS ---
+  // --- DELETE LOGIC ---
+
+  static Future<void> deleteSession(int sessionId) async {
+    final database = await db;
+    await database.transaction((txn) async {
+      await txn.delete('samples', where: 'session_id = ?', whereArgs: [sessionId]);
+      await txn.delete('raw_5s_blocks', where: 'session_id = ?', whereArgs: [sessionId]);
+      await txn.delete('scored_epochs', where: 'session_id = ?', whereArgs: [sessionId]);
+      await txn.delete('sleep_summaries', where: 'session_id = ?', whereArgs: [sessionId]);
+      await txn.delete('sessions', where: 'session_id = ?', whereArgs: [sessionId]);
+    });
+  }
+
+  // NEW: Delete sessions older than specified duration
+  static Future<int> deleteSessionsOlderThan(Duration duration) async {
+    final database = await db;
+    final cutoffTime = DateTime.now().subtract(duration).millisecondsSinceEpoch;
+    
+    final oldSessions = await database.query(
+      'sessions',
+      where: 'start_time_ms < ?',
+      whereArgs: [cutoffTime],
+    );
+    
+    int deletedCount = 0;
+    for (final session in oldSessions) {
+      final sessionId = session['session_id'] as int;
+      await deleteSession(sessionId);
+      deletedCount++;
+    }
+    
+    if (deletedCount > 0) {
+      print('🧹 Cleaned up $deletedCount old sessions (>${duration.inDays} days)');
+    }
+    
+    return deletedCount;
+  }
+
+  // NEW: Clean up old data (public method to call on app start)
+  static Future<void> cleanupOldData({int retentionDays = 14}) async {
+    await deleteSessionsOlderThan(Duration(days: retentionDays));
+  }
+
+  // NEW: Get oldest session age in days
+  static Future<int> getOldestSessionDays() async {
+    final database = await db;
+    final result = await database.rawQuery('''
+      SELECT MIN(start_time_ms) as oldest 
+      FROM sessions
+    ''');
+    
+    final oldestMs = result.first['oldest'] as int?;
+    if (oldestMs == null) return 0;
+    
+    final oldestDate = DateTime.fromMillisecondsSinceEpoch(oldestMs);
+    return DateTime.now().difference(oldestDate).inDays;
+  }
+
+  // NEW: Get storage statistics
+  static Future<Map<String, int>> getStorageStats() async {
+    final database = await db;
+    
+    final sessionCount = Sqflite.firstIntValue(
+      await database.rawQuery('SELECT COUNT(*) FROM sessions')
+    ) ?? 0;
+    
+    final sampleCount = Sqflite.firstIntValue(
+      await database.rawQuery('SELECT COUNT(*) FROM samples')
+    ) ?? 0;
+    
+    final epochCount = Sqflite.firstIntValue(
+      await database.rawQuery('SELECT COUNT(*) FROM scored_epochs')
+    ) ?? 0;
+    
+    final summaryCount = Sqflite.firstIntValue(
+      await database.rawQuery('SELECT COUNT(*) FROM sleep_summaries')
+    ) ?? 0;
+    
+    return {
+      'sessions': sessionCount,
+      'samples': sampleCount,
+      'epochs': epochCount,
+      'summaries': summaryCount,
+    };
+  }
+
+  // --- HELPER METHODS ---
 
   static Future<int> countSamples() async {
     final database = await db;
@@ -350,15 +477,28 @@ class AppDb {
   }
 
   static Future<void> upsertSleepSummary({
-    required int sessionId, required double timeInBedMin, required double totalSleepTimeMin,
-    required double sleepLatencyMin, required double wasoMin, required double sleepEfficiencyPct,
-    required int? sleepOnsetMs, required int? finalWakeMs,
+    required int sessionId, 
+    required double timeInBedMin, 
+    required double totalSleepTimeMin,
+    required double sleepLatencyMin, 
+    required double wasoMin, 
+    required double sleepEfficiencyPct,
+    required int? sleepOnsetMs, 
+    required int? finalWakeMs,
+    required double sleepScore,
   }) async {
     final database = await db;
     await database.insert('sleep_summaries', {
-      'session_id': sessionId, 'time_in_bed_min': timeInBedMin, 'total_sleep_time_min': totalSleepTimeMin,
-      'sleep_latency_min': sleepLatencyMin, 'waso_min': wasoMin, 'sleep_efficiency_pct': sleepEfficiencyPct,
-      'sleep_onset_ms': sleepOnsetMs, 'final_wake_ms': finalWakeMs, 'generated_at_ms': DateTime.now().millisecondsSinceEpoch,
+      'session_id': sessionId, 
+      'time_in_bed_min': timeInBedMin, 
+      'total_sleep_time_min': totalSleepTimeMin,
+      'sleep_latency_min': sleepLatencyMin, 
+      'waso_min': wasoMin, 
+      'sleep_efficiency_pct': sleepEfficiencyPct,
+      'sleep_onset_ms': sleepOnsetMs, 
+      'final_wake_ms': finalWakeMs,
+      'sleep_score': sleepScore,
+      'generated_at_ms': DateTime.now().millisecondsSinceEpoch,
     }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
@@ -380,15 +520,15 @@ class AppDb {
     return database.query('samples', where: 'session_id = ?', whereArgs: [sessionId], orderBy: 'timestamp_ms ASC');
   }
 
-static Future<List<Map<String, Object?>>> get5sBlocksForSession(int sessionId) async {
-  final dbClient = await db;
-  return await dbClient.query(
-    'raw_5s_blocks',
-    where: 'session_id = ?',
-    whereArgs: [sessionId],
-    orderBy: 'block_start_ms ASC',
-  );
-}
+  static Future<List<Map<String, Object?>>> get5sBlocksForSession(int sessionId) async {
+    final dbClient = await db;
+    return await dbClient.query(
+      'raw_5s_blocks',
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
+      orderBy: 'block_start_ms ASC',
+    );
+  }
 
   static Future<List<Map<String, Object?>>> getScoredEpochsForSession(int sessionId) async {
     final database = await db;
@@ -404,7 +544,6 @@ static Future<List<Map<String, Object?>>> get5sBlocksForSession(int sessionId) a
       await txn.delete('sleep_summaries');
       await txn.delete('sessions');
 
-      // Reset auto-increment counters
       await txn.execute("DELETE FROM sqlite_sequence WHERE name = 'samples'");
       await txn.execute("DELETE FROM sqlite_sequence WHERE name = 'raw_5s_blocks'");
       await txn.execute("DELETE FROM sqlite_sequence WHERE name = 'scored_epochs'");
