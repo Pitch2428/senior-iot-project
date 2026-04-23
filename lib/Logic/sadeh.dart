@@ -82,7 +82,7 @@ class SleepScorer {
     List<Map<String, Object?>> rows, {
     int epochSeconds = 30,
     SleepAlgorithm algorithm = SleepAlgorithm.sadehScaledConvolved,
-    double activityScale = 0.1, 
+    double activityScale = 500.0, 
   }) {
     if (rows.isEmpty) return [];
 
@@ -172,7 +172,7 @@ class SleepScorer {
     double logPenalty = (currentAct > 2.0) ? (0.75 * log(currentAct + 1.0)) : 0.0;
 
     // Increased constant to 15.0 to handle M5StickC sensitivity
-    return 15.0 - (0.065 * meanW11) - (1.08 * nat) - (0.056 * sd6) - logPenalty;
+    return 7.601 - (0.065 * meanW11) - (1.08 * nat) - (0.056 * sd6) - logPenalty;
   }
 
   static List<ScoredEpoch> _applySmoothing(List<ScoredEpoch> epochs) {
@@ -233,6 +233,30 @@ class SleepScorer {
     );
   }
 
+  // NEW: Calculate Sleep Score based on the formula from DeepSeek conversation
+  static double calculateSleepScore(SleepMetrics metrics) {
+    // A: Total Sleep Time Score (target is 8 hours = 480 minutes)
+    final aScore = (metrics.totalSleepTimeMinutes / 480).clamp(0.0, 1.0) * 100;
+
+    // B: Sleep Efficiency Score
+    double bScore = 0.0;
+    if (metrics.timeInBedMinutes > 0) {
+      bScore = (metrics.totalSleepTimeMinutes / metrics.timeInBedMinutes).clamp(0.0, 1.0) * 100;
+    }
+
+    // D: Sleep Latency Score (target is 30 minutes)
+    final dScore = (1 - (metrics.sleepLatencyMinutes / 30)).clamp(0.0, 1.0) * 100;
+
+    // E: Wake-ups / Fragmentation Score (target is 60 minutes awake)
+    final eScore = (1 - (metrics.wasoMinutes / 60)).clamp(0.0, 1.0) * 100;
+
+    // Final Weighted Score: 47% A, 29% B, 12% D, 12% E
+    final sleepScore = (0.47 * aScore) + (0.29 * bScore) + (0.12 * dScore) + (0.12 * eScore);
+    
+    // Return the score, clamped between 0 and 100
+    return sleepScore.clamp(0.0, 100.0);
+  }
+
   static List<_EpochFeature> _buildEpochs(List<Map<String, Object?>> rows, {required int epochSeconds}) {
     final epochMs = epochSeconds * 1000;
     int currentStart = ((rows.first['timestamp_ms'] as int) ~/ epochMs) * epochMs;
@@ -266,7 +290,7 @@ class SleepScorer {
       if (lx != null) {
         double diff = sqrt(pow(ax-lx, 2) + pow(ay-ly!, 2) + pow(az-lz!, 2));
         // Noise floor filtering for stationary M5Stack devices
-        actSum += (diff < 0.02) ? 0 : diff; 
+        actSum += (diff < 0.005) ? 0 : diff; 
       }
       lx = ax; ly = ay; lz = az;
       
