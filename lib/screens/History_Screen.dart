@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'dart:ui' as ui;
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:flutter/rendering.dart';
 
 import '../Database/AppDb.dart';
 import '../logic/sadeh.dart';
@@ -30,6 +34,8 @@ class HistoryScreen extends StatefulWidget {
 }
 
 class _HistoryScreenState extends State<HistoryScreen> {
+  final GlobalKey _screenshotKey = GlobalKey();
+  
   bool isDayView = true;
   DateTime selectedDate = DateTime.now();
   List<Map<String, dynamic>> _allSessions = [];
@@ -42,6 +48,36 @@ class _HistoryScreenState extends State<HistoryScreen> {
   void initState() {
     super.initState();
     _loadInitialData();
+  }
+
+  Future<void> _takeScreenshot() async {
+    try {
+      final boundary = _screenshotKey.currentContext!
+          .findRenderObject() as RenderRepaintBoundary;
+      final image = await boundary.toImage(pixelRatio: 2.0);
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      final imageBytes = byteData!.buffer.asUint8List();
+      
+      final directory = await getTemporaryDirectory();
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final imagePath = '${directory.path}/history_screenshot_$timestamp.png';
+      final file = await File(imagePath).writeAsBytes(imageBytes);
+      
+      await Share.shareXFiles([XFile(file.path)], subject: 'Sleep History Screenshot');
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Screenshot saved!")),
+        );
+      }
+    } catch (e) {
+      debugPrint('Screenshot error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Screenshot failed: $e")),
+        );
+      }
+    }
   }
 
   Future<void> _loadInitialData() async {
@@ -141,7 +177,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
       final List<ScoredEpoch> generated = SleepScorer.scoreRows(
         samples,
         algorithm: SleepAlgorithm.sadehScaledConvolved,
-        activityScale: 500.0,
+        activityScale: 1.0,
       );
 
       if (mounted) {
@@ -183,7 +219,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xFF2D2B5E),
-        title: Text(title, style: const TextStyle(color: Colors.white)),
+        title: Text(title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -201,7 +237,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                 children: [
                   const Text("Info:", style: TextStyle(color: Colors.cyanAccent, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 4),
-                  Text(tips, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                  Text(tips, style: const TextStyle(color: Colors.white60, fontSize: 12)),
                 ],
               ),
             ),
@@ -210,7 +246,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: const Text("continue", style: TextStyle(color: Colors.cyanAccent)),
+            child: const Text("Got it", style: TextStyle(color: Colors.cyanAccent, fontWeight: FontWeight.bold)),
           ),
         ],
       ),
@@ -231,7 +267,12 @@ class _HistoryScreenState extends State<HistoryScreen> {
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.help_outline, color: Colors.white54),
+            icon: const Icon(Icons.camera_alt, color: Colors.white),
+            onPressed: _takeScreenshot,
+            tooltip: "Take Screenshot",
+          ),
+          IconButton(
+            icon: const Icon(Icons.help_outline, color: Colors.white60),
             onPressed: () => _showMetricInfo(
               "Understanding Your Sleep Data",
               "Your sleep score is calculated from 4 key metrics:\n\n"
@@ -241,31 +282,33 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   "• WASO (12%): Wake after sleep onset\n\n"
                   "Higher scores (85-100) indicate better sleep quality.",
               "• Aim for 7-9 hours of sleep\n"
-                  "• Try to fall asleep within 30 minutes\n",
             ),
           ),
         ],
       ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator(color: Colors.cyanAccent))
-          : RefreshIndicator(
-              onRefresh: () => _loadData(),
-              color: Colors.cyanAccent,
-              child: SingleChildScrollView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Column(
-                  children: [
-                    _buildHeader(),
-                    const SizedBox(height: 20),
-                    _buildToggle(),
-                    const SizedBox(height: 30),
-                    if (isDayView) _buildDayView() else _buildWeekContent(),
-                    const SizedBox(height: 40),
-                  ],
+      body: RepaintBoundary(
+        key: _screenshotKey,
+        child: _isLoading
+            ? const Center(child: CircularProgressIndicator(color: Colors.cyanAccent))
+            : RefreshIndicator(
+                onRefresh: () => _loadData(),
+                color: Colors.cyanAccent,
+                child: SingleChildScrollView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: Column(
+                    children: [
+                      _buildHeader(),
+                      const SizedBox(height: 20),
+                      _buildToggle(),
+                      const SizedBox(height: 30),
+                      if (isDayView) _buildDayView() else _buildWeekContent(),
+                      const SizedBox(height: 40),
+                    ],
+                  ),
                 ),
               ),
-            ),
+      ),
     );
   }
 
@@ -273,7 +316,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
     if (_filteredSessions.isEmpty && _selectedSession == null) {
       return const Padding(
         padding: EdgeInsets.only(top: 100),
-        child: Text("No Data for this Date", style: TextStyle(color: Colors.white54)),
+        child: Text("No Data for this Date", style: TextStyle(color: Colors.white60, fontSize: 16)),
       );
     }
     final session = _selectedSession ?? _filteredSessions.first;
@@ -304,7 +347,6 @@ class _HistoryScreenState extends State<HistoryScreen> {
             "Latency (12%), and WASO (12%).\n\n"
             "85-100: Excellent | 70-84: Good | 60-69: Fair | 50-59: Poor | 0-49: Very Poor",
         "• Aim for 85+ for optimal rest\n"
-            "• Track trends over time\n",
       ),
       child: Container(
         padding: const EdgeInsets.all(20),
@@ -348,7 +390,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   style: TextStyle(
                     color: scoreColor,
                     fontSize: 14,
-                    fontWeight: FontWeight.w500,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
               ],
@@ -391,8 +433,9 @@ class _HistoryScreenState extends State<HistoryScreen> {
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text("Sleep Analysis", style: TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)),
-          Text(DateFormat('EEE, MMM dd').format(selectedDate), style: const TextStyle(color: Colors.cyanAccent, fontSize: 16)),
+          const Text("Sleep Analysis", style: TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          Text(DateFormat('EEEE, MMM d').format(selectedDate), style: const TextStyle(color: Colors.cyanAccent, fontSize: 16, fontWeight: FontWeight.w500)),
         ]),
         IconButton(
             icon: const Icon(Icons.calendar_month, color: Colors.white),
@@ -422,7 +465,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
         child: Container(
           decoration: BoxDecoration(color: active ? Colors.cyanAccent : Colors.transparent, borderRadius: BorderRadius.circular(20)),
           alignment: Alignment.center,
-          child: Text(text, style: TextStyle(color: active ? const Color(0xFF3F3B76) : Colors.white70, fontWeight: FontWeight.bold, fontSize: 12)),
+          child: Text(text, style: TextStyle(color: active ? const Color(0xFF3F3B76) : Colors.white70, fontWeight: FontWeight.bold, fontSize: 13)),
         ),
       ),
     );
@@ -447,10 +490,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
       mainAxisSpacing: 12,
       crossAxisSpacing: 12,
       children: [
-        _buildMetricWithInfo("Efficiency", "${eff.toStringAsFixed(1)}%", "Percentage of time in bed that you were actually asleep.\n\n" "Formula: (Total Sleep Time ÷ Time in Bed) × 100", "• 85%+ is considered healthy\n" "• Low efficiency = spending too much time awake in bed\n"),
+        _buildMetricWithInfo("Efficiency", "${eff.toStringAsFixed(1)}%", "Percentage of time in bed that you were actually asleep.\n\n" "Formula: (Total Sleep Time ÷ Time in Bed) × 100", "• 85%+ is considered healthy\n" "• Low efficiency = spending too much time awake in bed\n" "• Try to limit time in bed if not sleeping"),
         _buildMetricWithInfo("Total Sleep", _formatDuration(tst), "Total time you were actually asleep during the session.\n\n" "This excludes time spent awake in bed.", "• Adults need 7-9 hours per night\n" "• Consistency is more important than catching up on weekends\n" "• Short sleep affects next-day performance"),
         _buildMetricWithInfo("Latency", _formatDuration(lat), "How long it took you to fall asleep after going to bed.\n\n" "Time from lights out to first sleep epoch.", "• 15-30 minutes is normal\n" "• >30 minutes may indicate insomnia\n" "• Try relaxation techniques before bed"),
-        _buildMetricWithInfo("WASO", _formatDuration(waso), "Wake After Sleep Onset - time spent awake during the night.\n\n" "This includes all awakenings after initially falling asleep.", "• <60 minutes is good\n" "• Brief awakenings are normal\n"),
+        _buildMetricWithInfo("WASO", _formatDuration(waso), "Wake After Sleep Onset - time spent awake during the night.\n\n" "This includes all awakenings after initially falling asleep.", "• <60 minutes is good\n" "• Brief awakenings are normal\n" "• Frequent waking may indicate sleep apnea"),
         _buildMetricWithInfo("Fell Asleep", formatClock(s['sleep_onset_ms']), "The time when you first fell asleep.\n\n" "Based on when sleep was first detected.", "• Consistent bedtimes improve sleep quality\n" "• Try to sleep at the same time every night"),
         _buildMetricWithInfo("Woke Up", formatClock(s['final_wake_ms']), "The time when you finally woke up for the day.\n\n" "The end of your last sleep period.", "• Consistent wake times help regulate circadian rhythm\n" "• Try to wake up at the same time even on weekends"),
       ],
@@ -468,13 +511,13 @@ class _HistoryScreenState extends State<HistoryScreen> {
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Text(label, style: const TextStyle(color: Colors.white38, fontSize: 10)),
+                Text(label, style: const TextStyle(color: Colors.white60, fontSize: 10, fontWeight: FontWeight.w500)),
                 const SizedBox(width: 4),
-                const Icon(Icons.info_outline, color: Colors.white24, size: 10),
+                const Icon(Icons.info_outline, color: Colors.white38, size: 10),
               ],
             ),
             const SizedBox(height: 4),
-            Text(value, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600)),
+            Text(value, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
           ],
         ),
       ),
@@ -484,19 +527,25 @@ class _HistoryScreenState extends State<HistoryScreen> {
   Widget _buildTimelineSection() {
     if (_currentEpochs.isEmpty) return const SizedBox.shrink();
 
+    // Calculate total duration for better time labels
+    final firstTimestamp = _currentEpochs.first.timestamp;
+    final lastTimestamp = _currentEpochs.last.timestamp;
+    final totalMinutes = (lastTimestamp - firstTimestamp) / 60000;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         GestureDetector(
           onTap: () => _showMetricInfo(
             "Sleep Timeline (Hypnogram)",
-            "A visual representation of your sleep stages over time\n\n"
-                "• Cyan line: Sleep \n"
-                "• Orange bars: Wake \n"
-                "• The line goes up during wake, down during sleep",
-            "• long cyan line = good sleep\n"
+            "A visual representation of your sleep/wake states over time\n\n"
+                "• Blue line going DOWN = Sleep\n"
+                "• Blue line going UP = Wake\n"
+                "• Orange bars = Wake episodes\n\n"
+                "This chart shows your entire sleep session at a glance.",
+            "• Long blue sections = good sleep\n"
                 "• Frequent orange bars = restless sleep\n"
-                "• Pinch to zoom and swipe to see details",
+                "• Multiple wake-ups near the end = natural light sleep phase",
           ),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -506,72 +555,105 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   Text("Sleep Timeline",
                       style: TextStyle(
                           color: Colors.white70,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w500)),
-                  SizedBox(width: 4),
-                  Icon(Icons.info_outline, color: Colors.white38, size: 14),
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600)),
+                  SizedBox(width: 6),
+                  Icon(Icons.info_outline, color: Colors.white38, size: 16),
                 ],
               ),
               Row(
                 children: [
-                  _legendItem("Sleep", Colors.cyanAccent),
-                  const SizedBox(width: 12),
-                  _legendItem("Wake", Colors.orangeAccent),
+                  _legendItem("Asleep", Colors.cyanAccent),
+                  const SizedBox(width: 16),
+                  _legendItem("Awake", Colors.orangeAccent),
                 ],
               ),
             ],
           ),
         ),
-        const SizedBox(height: 15),
-        LayoutBuilder(builder: (context, constraints) {
-          final double baseWidth = constraints.maxWidth;
-          
-          return Container(
-            height: 180,
-            width: double.infinity,
-            decoration: BoxDecoration(
-                color: Colors.black26, borderRadius: BorderRadius.circular(12)),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: InteractiveViewer(
-                constrained: true, 
-                minScale: 1.0,
-                maxScale: 15.0,
-                child: SizedBox(
-                  width: baseWidth,
-                  height: 160,
-                  child: CustomPaint(
-                    size: Size(baseWidth, 160),
-                    painter: HypnogramPainter(
-                      epochs: _currentEpochs, 
-                      stepWidth: baseWidth / _currentEpochs.length,
-                    ),
+        const SizedBox(height: 12),
+        Container(
+          width: double.infinity,
+          decoration: BoxDecoration(
+            color: Colors.black26,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            children: [
+              // Time labels bar
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: _buildTimeLabels(),
+                ),
+              ),
+              // Timeline chart
+              SizedBox(
+                height: 200,
+                width: double.infinity,
+                child: CustomPaint(
+                  size: Size(MediaQuery.of(context).size.width - 40, 200),
+                  painter: ImprovedHypnogramPainter(
+                    epochs: _currentEpochs,
                   ),
                 ),
               ),
-            ),
-          );
-        }),
-        const Padding(
-          padding: EdgeInsets.only(top: 8.0),
-          child: Center(
-            child: Text("← Pinch to zoom • Swipe to scroll →",
-                style: TextStyle(
-                    color: Colors.white24,
-                    fontSize: 10,
-                    fontStyle: FontStyle.italic)),
+              // Simple legend
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Container(width: 20, height: 3, color: Colors.cyanAccent),
+                    const SizedBox(width: 6),
+                    const Text("Sleep", style: TextStyle(color: Colors.white60, fontSize: 11)),
+                    const SizedBox(width: 20),
+                    Container(width: 20, height: 3, color: Colors.orangeAccent),
+                    const SizedBox(width: 6),
+                    const Text("Wake", style: TextStyle(color: Colors.white60, fontSize: 11)),
+                  ],
+                ),
+              ),
+            ],
           ),
-        )
+        ),
       ],
     );
+  }
+
+  List<Widget> _buildTimeLabels() {
+    if (_currentEpochs.isEmpty) return [];
+    
+    final firstTime = DateTime.fromMillisecondsSinceEpoch(_currentEpochs.first.timestamp);
+    final lastTime = DateTime.fromMillisecondsSinceEpoch(_currentEpochs.last.timestamp);
+    final totalDuration = lastTime.difference(firstTime).inMinutes;
+    
+    // Show 4-6 time labels
+    final numLabels = 5;
+    final intervalMinutes = (totalDuration / (numLabels - 1)).toInt();
+    
+    List<Widget> labels = [];
+    for (int i = 0; i < numLabels; i++) {
+      final labelTime = firstTime.add(Duration(minutes: intervalMinutes * i));
+      final timeString = DateFormat('h:mm a').format(labelTime);
+      labels.add(
+        Text(
+          timeString,
+          style: const TextStyle(color: Colors.white60, fontSize: 11, fontWeight: FontWeight.w500),
+        ),
+      );
+    }
+    
+    return labels;
   }
 
   Widget _legendItem(String label, Color color) {
     return Row(
       children: [
-        Container(width: 12, height: 12, decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(2))),
-        const SizedBox(width: 4),
-        Text(label, style: const TextStyle(color: Colors.white54, fontSize: 10)),
+        Container(width: 14, height: 14, decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(3))),
+        const SizedBox(width: 6),
+        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.w500)),
       ],
     );
   }
@@ -583,7 +665,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
       const Divider(color: Colors.white10, height: 40),
       const Padding(
         padding: EdgeInsets.only(bottom: 12),
-        child: Text("Other Sessions", style: TextStyle(color: Colors.white38, fontSize: 12)),
+        child: Text("Other Sessions", style: TextStyle(color: Colors.white60, fontSize: 13, fontWeight: FontWeight.w500)),
       ),
       ..._filteredSessions.map((s) {
         final id = s['session_id'] ?? s['id'];
@@ -594,10 +676,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
         return ListTile(
           onTap: () => _loadAnalysisForSession(s),
           contentPadding: EdgeInsets.zero,
-          leading: Icon(Icons.nights_stay_outlined, color: isSelected ? Colors.cyanAccent : Colors.white24),
-          title: Text("Session #$id", style: TextStyle(color: isSelected ? Colors.white : Colors.white60, fontSize: 14)),
-          subtitle: Text("Score: ${sleepScore.round()} - ${_getScoreLabel(sleepScore)}", style: TextStyle(color: scoreColor, fontSize: 11)),
-          trailing: Icon(Icons.arrow_forward_ios, color: isSelected ? Colors.cyanAccent : Colors.white10, size: 14),
+          leading: Icon(Icons.nights_stay_outlined, color: isSelected ? Colors.cyanAccent : Colors.white38, size: 20),
+          title: Text("Session #$id", style: TextStyle(color: isSelected ? Colors.white : Colors.white70, fontSize: 14, fontWeight: isSelected ? FontWeight.w600 : FontWeight.w400)),
+          subtitle: Text("Score: ${sleepScore.round()} — ${_getScoreLabel(sleepScore)}", style: TextStyle(color: scoreColor, fontSize: 12, fontWeight: FontWeight.w500)),
+          trailing: Icon(Icons.arrow_forward_ios, color: isSelected ? Colors.cyanAccent : Colors.white24, size: 14),
         );
       }),
     ]);
@@ -643,7 +725,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
             "• Bars show total sleep time\n"
             "• Numbers above bars show sleep score\n"
             "• Green bars = good sleep, Orange = short sleep",
-        "• Track how weekends affect your sleep",
+        "• Track how weekends affect your sleep\n"
+            "• Aim for consistency across all days",
       ),
       child: Column(
         children: [
@@ -683,24 +766,24 @@ class _HistoryScreenState extends State<HistoryScreen> {
                           "${dayScore.round()}",
                           style: TextStyle(
                             color: _getScoreColor(dayScore),
-                            fontSize: 9,
+                            fontSize: 10,
                             fontWeight: FontWeight.bold,
                           ),
                         ),
                       const SizedBox(height: 2),
                       FittedBox(
                         child: Text(
-                          tst == 0 ? "-" : _formatDuration(tst),
+                          tst == 0 ? "—" : _formatDuration(tst),
                           style: TextStyle(
-                            color: tst == 0 ? Colors.white24 : (isLow ? Colors.orangeAccent : Colors.cyanAccent),
-                            fontSize: 8,
-                            fontWeight: FontWeight.bold,
+                            color: tst == 0 ? Colors.white38 : (isLow ? Colors.orangeAccent : Colors.cyanAccent),
+                            fontSize: 9,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
                       ),
                       const SizedBox(height: 6),
                       Container(
-                        width: 20,
+                        width: 24,
                         height: barHeight,
                         decoration: BoxDecoration(
                             color: tst == 0 ? Colors.white.withOpacity(0.05) : null,
@@ -714,10 +797,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
                                       isLow ? Colors.orangeAccent.withOpacity(0.2) : Colors.cyanAccent.withOpacity(0.1),
                                     ],
                                   ),
-                            borderRadius: BorderRadius.circular(4)),
+                            borderRadius: BorderRadius.circular(6)),
                       ),
                       const SizedBox(height: 8),
-                      Text(DateFormat('E').format(date), style: const TextStyle(color: Colors.white70, fontSize: 10)),
+                      Text(DateFormat('E').format(date), style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.w500)),
                     ],
                   ),
                 );
@@ -732,7 +815,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
   Widget _weeklyStat(String label, String value) {
     return Column(
       children: [
-        Text(label, style: const TextStyle(color: Colors.white38, fontSize: 12)),
+        Text(label, style: const TextStyle(color: Colors.white60, fontSize: 12, fontWeight: FontWeight.w500)),
         const SizedBox(height: 4),
         Text(value, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
       ],
@@ -740,82 +823,117 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 }
 
-class HypnogramPainter extends CustomPainter {
+// Improved Hypnogram Painter - cleaner, clearer, no zoom/swipe needed
+class ImprovedHypnogramPainter extends CustomPainter {
   final List<SleepEpochUI> epochs;
-  final double stepWidth;
 
-  HypnogramPainter({required this.epochs, required this.stepWidth});
+  ImprovedHypnogramPainter({required this.epochs});
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (epochs.isEmpty) return;
+    if (epochs.isEmpty || size.width <= 0) return;
 
-    final double wakeY = size.height * 0.20;
-    final double sleepY = size.height * 0.65;
-    final double labelY = size.height * 0.85;
-
-    final textPainter = TextPainter(textDirection: ui.TextDirection.ltr);
-    final Paint linePaint = Paint()
-      ..color = Colors.white.withOpacity(0.05)
-      ..strokeWidth = 1.0;
-
-    int labelIntervalMinutes = 60;
-    if (epochs.length < 240) labelIntervalMinutes = 30;
-    if (epochs.length < 120) labelIntervalMinutes = 15;
-
+    final double topY = size.height * 0.15;      // Wake area top
+    final double sleepY = size.height * 0.75;    // Sleep area bottom
+    final double awakeY = size.height * 0.25;    // Wake line position
+    
+    final double epochWidth = size.width / epochs.length;
+    
+    // Draw background alternating pattern
+    final Paint bgPaint = Paint()..color = Colors.white.withOpacity(0.03);
     for (int i = 0; i < epochs.length; i++) {
-      final DateTime epochTime = DateTime.fromMillisecondsSinceEpoch(epochs[i].timestamp);
-
-      if (epochTime.minute % labelIntervalMinutes == 0 && epochTime.second == 0 || i == 0) {
-        double x = i * stepWidth;
-        canvas.drawLine(Offset(x, 0), Offset(x, labelY), linePaint);
-
-        String timeLabel = DateFormat('HH:mm').format(epochTime);
-        textPainter.text = TextSpan(
-          text: timeLabel,
-          style: const TextStyle(color: Colors.white38, fontSize: 9, fontWeight: FontWeight.bold),
+      if (i % 2 == 0) {
+        canvas.drawRect(
+          Rect.fromLTWH(i * epochWidth, 0, epochWidth, size.height),
+          bgPaint,
         );
-        textPainter.layout();
-
-        double xPos = x - (textPainter.width / 2);
-        if (xPos < 0) xPos = 0;
-        if (xPos + textPainter.width > size.width) xPos = size.width - textPainter.width;
-        
-        textPainter.paint(canvas, Offset(xPos, labelY + 4));
       }
     }
-
+    
+    // Draw horizontal reference lines
+    final Paint linePaint = Paint()
+      ..color = Colors.white.withOpacity(0.08)
+      ..strokeWidth = 0.5;
+    
+    canvas.drawLine(Offset(0, sleepY), Offset(size.width, sleepY), linePaint);
+    canvas.drawLine(Offset(0, awakeY), Offset(size.width, awakeY), linePaint);
+    
+    // Draw the sleep/wake line
     final Path sleepPath = Path();
-    final Paint sleepPaint = Paint()
+    final Paint linePaintMain = Paint()
       ..color = Colors.cyanAccent
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.0
-      ..strokeJoin = StrokeJoin.round;
-
-    sleepPath.moveTo(0, epochs[0].isSleep ? sleepY : wakeY);
+      ..strokeWidth = 2.5
+      ..strokeJoin = StrokeJoin.round
+      ..strokeCap = StrokeCap.round;
+    
+    // Draw filled area under the curve
+    final Path fillPath = Path();
+    final Paint fillPaint = Paint()
+      ..color = Colors.cyanAccent.withOpacity(0.15)
+      ..style = PaintingStyle.fill;
+    
     for (int i = 0; i < epochs.length; i++) {
-      double xStart = i * stepWidth;
-      double xEnd = (i + 1) * stepWidth;
-      double targetY = epochs[i].isSleep ? sleepY : wakeY;
+      double x = i * epochWidth;
+      double y = epochs[i].isSleep ? sleepY : awakeY;
       
-      sleepPath.lineTo(xStart, targetY);
-      sleepPath.lineTo(xEnd, targetY);
+      if (i == 0) {
+        sleepPath.moveTo(x, y);
+        fillPath.moveTo(x, sleepY);
+        fillPath.lineTo(x, y);
+      } else {
+        sleepPath.lineTo(x, y);
+        fillPath.lineTo(x, y);
+      }
     }
-    canvas.drawPath(sleepPath, sleepPaint);
-
-    final Paint wakeMarkerPaint = Paint()..color = Colors.orangeAccent;
+    
+    // Complete fill path
+    fillPath.lineTo(size.width, sleepY);
+    fillPath.lineTo(0, sleepY);
+    fillPath.close();
+    
+    canvas.drawPath(fillPath, fillPaint);
+    canvas.drawPath(sleepPath, linePaintMain);
+    
+    // Draw wake markers (orange bars at the top)
+    final Paint wakePaint = Paint()
+      ..color = Colors.orangeAccent
+      ..style = PaintingStyle.fill;
+    
     for (int i = 0; i < epochs.length; i++) {
       if (!epochs[i].isSleep) {
-        double rectWidth = stepWidth < 1.0 ? 1.0 : stepWidth;
-        canvas.drawRect(
-          Rect.fromLTWH(i * stepWidth, wakeY - 4, rectWidth, 8), 
-          wakeMarkerPaint
+        double x = i * epochWidth;
+        double barWidth = epochWidth * 0.7;
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(x + (epochWidth - barWidth) / 2, topY, barWidth, size.height * 0.08),
+            const Radius.circular(3),
+          ),
+          wakePaint,
         );
       }
     }
+    
+    // Add small labels
+    final TextPainter textPainter = TextPainter(textDirection: ui.TextDirection.ltr);
+    
+    textPainter.text = TextSpan(
+      text: "💤 SLEEP",
+      style: const TextStyle(color: Colors.cyanAccent, fontSize: 10, fontWeight: FontWeight.bold),
+    );
+    textPainter.layout();
+    textPainter.paint(canvas, Offset(8, sleepY - 12));
+    
+    textPainter.text = TextSpan(
+      text: "🌙 AWAKE",
+      style: const TextStyle(color: Colors.orangeAccent, fontSize: 10, fontWeight: FontWeight.bold),
+    );
+    textPainter.layout();
+    textPainter.paint(canvas, Offset(8, awakeY - 12));
   }
 
   @override
-  bool shouldRepaint(covariant HypnogramPainter oldDelegate) => 
-      oldDelegate.epochs.length != epochs.length || oldDelegate.stepWidth != stepWidth;
+  bool shouldRepaint(covariant ImprovedHypnogramPainter oldDelegate) {
+    return oldDelegate.epochs.length != epochs.length;
+  }
 }

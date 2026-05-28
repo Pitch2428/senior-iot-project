@@ -5,6 +5,8 @@ import 'package:path_provider/path_provider.dart';
 import '../Database/AppDb.dart';
 import '../screens/history_screen.dart';
 import '../logic/sadeh.dart';
+import 'dart:ui' as ui;
+import 'package:flutter/rendering.dart';
 
 // ==================== CONSTANTS ====================
 
@@ -37,6 +39,9 @@ class _JournalScreenState extends State<JournalScreen> {
   bool _isLoading = true;
   bool _isProcessing = false;
   List<Map<String, dynamic>> _nights = [];
+  
+  // Set to true for presentation screenshots, false for normal app use
+  bool _demoMode = false;
 
   @override
   void initState() {
@@ -51,6 +56,17 @@ class _JournalScreenState extends State<JournalScreen> {
     setState(() => _isLoading = true);
 
     try {
+      // DEMO MODE: For clean presentation screenshots
+      if (_demoMode) {
+        final demoSessions = _generateRealisticDemoSessions();
+        setState(() {
+          _nights = demoSessions;
+          _isLoading = false;
+        });
+        return;
+      }
+      
+      // REAL DATA MODE
       final db = await AppDb.db;
       final sessions = await db.query('sessions', orderBy: 'start_time_ms DESC');
 
@@ -73,6 +89,228 @@ class _JournalScreenState extends State<JournalScreen> {
       debugPrint("Load Sessions error: $e");
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  // Generate realistic demo data matching your screenshots for May 18-23
+  List<Map<String, dynamic>> _generateRealisticDemoSessions() {
+    final demoSessions = <Map<String, dynamic>>[];
+    
+    // Data based on your screenshots (May 18-23, 2026)
+    final List<Map<String, dynamic>> sleepData = [
+      {
+        'date': DateTime(2026, 5, 23),
+        'start_hour': 22, 'start_min': 51,
+        'end_hour': 4, 'end_min': 49,
+        'total_sleep_min': 298, // 4h 58m
+        'score': 59,
+        'efficiency': 65,
+        'deep_sleep': 72,   // 1h 12m
+        'light_sleep': 181, // 3h 01m
+        'rem_sleep': 45,    // 0h 45m
+        'latency': 12,
+        'waso': 28,
+      },
+      {
+        'date': DateTime(2026, 5, 22),
+        'start_hour': 22, 'start_min': 11,
+        'end_hour': 7, 'end_min': 20,
+        'total_sleep_min': 549, // 9h 09m
+        'score': 91,
+        'efficiency': 88,
+        'deep_sleep': 56,   // 0h 56m
+        'light_sleep': 341, // 5h 41m
+        'rem_sleep': 152,   // 2h 32m
+        'latency': 8,
+        'waso': 15,
+      },
+      {
+        'date': DateTime(2026, 5, 21),
+        'start_hour': 23, 'start_min': 22,
+        'end_hour': 6, 'end_min': 21,
+        'total_sleep_min': 419, // 6h 59m
+        'score': 94,
+        'efficiency': 85,
+        'deep_sleep': 118,  // 1h 58m
+        'light_sleep': 239, // 3h 59m
+        'rem_sleep': 62,    // 1h 02m
+        'latency': 10,
+        'waso': 18,
+      },
+      {
+        'date': DateTime(2026, 5, 20),
+        'start_hour': 23, 'start_min': 9,
+        'end_hour': 7, 'end_min': 39,
+        'total_sleep_min': 510, // 8h 30m
+        'score': 85,
+        'efficiency': 82,
+        'deep_sleep': 48,   // 0h 48m
+        'light_sleep': 228, // 3h 48m
+        'rem_sleep': 234,   // 3h 54m
+        'latency': 15,
+        'waso': 22,
+      },
+      {
+        'date': DateTime(2026, 5, 19),
+        'start_hour': 23, 'start_min': 15,
+        'end_hour': 6, 'end_min': 53,
+        'total_sleep_min': 458, // 7h 38m
+        'score': 94,
+        'efficiency': 89,
+        'deep_sleep': 102,  // 1h 42m
+        'light_sleep': 145, // 2h 25m
+        'rem_sleep': 211,   // 3h 31m
+        'latency': 9,
+        'waso': 12,
+      },
+      {
+        'date': DateTime(2026, 5, 18),
+        'start_hour': 23, 'start_min': 10,
+        'end_hour': 5, 'end_min': 22,
+        'total_sleep_min': 372, // 6h 12m
+        'score': 44,
+        'efficiency': 62,
+        'deep_sleep': 45,
+        'light_sleep': 180,
+        'rem_sleep': 147,
+        'latency': 19,
+        'waso': 56,
+      },
+    ];
+    
+    for (int i = 0; i < sleepData.length; i++) {
+      final data = sleepData[i];
+      final date = data['date'] as DateTime;
+      
+      final startTime = DateTime(date.year, date.month, date.day, data['start_hour'], data['start_min']);
+      final endTime = DateTime(date.year, date.month, date.day + 1, data['end_hour'], data['end_min']);
+      
+      final totalSleepMin = data['total_sleep_min'] as int;
+      final score = (data['score'] as int).toDouble();
+      final efficiency = (data['efficiency'] as int).toDouble();
+      final latency = (data['latency'] as int).toDouble();
+      final waso = (data['waso'] as int).toDouble();
+      
+      demoSessions.add({
+        'session_id': 1000 + i,
+        'start_time_ms': startTime.millisecondsSinceEpoch,
+        'end_time_ms': endTime.millisecondsSinceEpoch,
+        'sleep_score': score,
+        'efficiency': efficiency,
+        'tst': totalSleepMin.toDouble(),
+        'tib': (totalSleepMin + latency + waso).toDouble(),
+        'latency': latency,
+        'waso': waso,
+        'needs_recalc': false,
+        // Additional fields for detailed sleep stages
+        'deep_sleep_min': data['deep_sleep'],
+        'light_sleep_min': data['light_sleep'],
+        'rem_sleep_min': data['rem_sleep'],
+      });
+    }
+    
+    return demoSessions;
+  }
+
+  // Original demo generation (kept for compatibility)
+  List<Map<String, dynamic>> _generateDemoSessions() {
+    final demoSessions = <Map<String, dynamic>>[];
+    final now = DateTime.now();
+    
+    final scores = [78, 82, 71, 88, 75, 84, 69, 91, 76, 80];
+    final durations = [410, 435, 385, 465, 400, 445, 365, 480, 420, 455];
+    final efficiencies = [82, 88, 76, 92, 80, 86, 73, 94, 84, 90];
+    final latencies = [25, 18, 32, 12, 28, 15, 35, 10, 22, 14];
+    final wasoValues = [45, 30, 52, 25, 42, 33, 58, 20, 38, 28];
+    
+    for (int i = 0; i < 10; i++) {
+      final date = DateTime(now.year, now.month, now.day - i);
+      
+      final startHour = 22;
+      final startMinute = 15 + (i % 4) * 5;
+      final endHour = 6;
+      final endMinute = 15 + (i % 6) * 5;
+      
+      final startTime = DateTime(date.year, date.month, date.day, startHour, startMinute);
+      final endTime = DateTime(date.year, date.month, date.day + 1, endHour, endMinute);
+      
+      final sleepMinutes = durations[i % durations.length];
+      final score = scores[i % scores.length];
+      final efficiency = efficiencies[i % efficiencies.length];
+      
+      demoSessions.add({
+        'session_id': 1000 + i,
+        'start_time_ms': startTime.millisecondsSinceEpoch,
+        'end_time_ms': endTime.millisecondsSinceEpoch,
+        'sleep_score': score.toDouble(),
+        'efficiency': efficiency.toDouble(),
+        'tst': sleepMinutes.toDouble(),
+        'tib': (sleepMinutes + 30).toDouble(),
+        'latency': latencies[i % latencies.length].toDouble(),
+        'waso': wasoValues[i % wasoValues.length].toDouble(),
+        'needs_recalc': false,
+      });
+    }
+    
+    return demoSessions;
+  }
+
+  // Fix existing sessions with incorrect end times
+  Future<void> _fixExistingSessions() async {
+    final db = await AppDb.db;
+    final sessions = await db.query('sessions');
+    int fixedCount = 0;
+    
+    for (final session in sessions) {
+      final sessionId = session['session_id'] as int;
+      final startMs = session['start_time_ms'] as int;
+      final currentEndMs = session['end_time_ms'] as int?;
+      
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final isInvalid = currentEndMs == null || 
+          currentEndMs > now || 
+          currentEndMs < startMs ||
+          currentEndMs > startMs + (16 * 60 * 60 * 1000);
+      
+      if (isInvalid) {
+        final fixedEndMs = startMs + (8 * 60 * 60 * 1000);
+        
+        await db.update(
+          'sessions',
+          {'end_time_ms': fixedEndMs},
+          where: 'session_id = ?',
+          whereArgs: [sessionId],
+        );
+        
+        await _processSessionLogic(sessionId);
+        fixedCount++;
+      }
+    }
+    
+    await _loadSessions();
+    
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Fixed $fixedCount sessions with incorrect end times"),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
+  }
+
+  // Toggle between demo and real mode
+  void _toggleDemoMode() {
+    setState(() {
+      _demoMode = !_demoMode;
+      _loadSessions();
+    });
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(_demoMode ? "Demo Mode ON - Showing realistic May 18-23 data" : "Real Data Mode ON"),
+        backgroundColor: _demoMode ? Colors.orange : Colors.green,
+      ),
+    );
   }
 
   int _parseSessionId(dynamic rawId) {
@@ -122,12 +360,12 @@ class _JournalScreenState extends State<JournalScreen> {
         ? SleepScorer.scoreRows(
             blocks,
             algorithm: SleepAlgorithm.sadehScaledConvolved,
-            activityScale: 500.0,
+            activityScale: 0.1,
           )
         : SleepScorer.scoreRows(
             await AppDb.getSamplesForSession(sessionId),
             algorithm: SleepAlgorithm.sadehScaledConvolved,
-            activityScale: 500.0,
+            activityScale: 0.1,
           );
 
     if (scoredEpochs.isEmpty) return;
@@ -366,9 +604,12 @@ class _JournalScreenState extends State<JournalScreen> {
       elevation: 0,
       centerTitle: true,
       leading: _buildBackButton(),
-      title: const Text(
-        "Sleep Journal",
-        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+      title: GestureDetector(
+        onLongPress: _toggleDemoMode,  // Long press title to toggle demo mode
+        child: const Text(
+          "Sleep Journal",
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 20),
+        ),
       ),
       actions: [
         IconButton(
@@ -445,7 +686,7 @@ class _JournalScreenState extends State<JournalScreen> {
         ),
         subtitle: Text(
           "${_formatTime(startVal)} - ${_formatTime(endVal)}",
-          style: const TextStyle(fontSize: 12, color: Colors.grey),
+          style: const TextStyle(fontSize: 12, color: Colors.black54),
         ),
         trailing: _buildCardActions(session, needsRecalc, sleepScore, themeColor, sessionId),
         children: [
@@ -468,7 +709,7 @@ class _JournalScreenState extends State<JournalScreen> {
       children: [
         Text(
           needsRecalc ? "NEW" : "${sleepScore.round()}",
-          style: TextStyle(color: themeColor, fontWeight: FontWeight.bold, fontSize: 16),
+          style: TextStyle(color: themeColor, fontWeight: FontWeight.bold, fontSize: 18),
         ),
         IconButton(
           icon: const Icon(Icons.share_outlined, color: Colors.blueAccent, size: 20),
@@ -513,7 +754,7 @@ class _JournalScreenState extends State<JournalScreen> {
         const Text(
           "Session recorded. Tap below to calculate your score.",
           textAlign: TextAlign.center,
-          style: TextStyle(color: Colors.black54, fontSize: 13),
+          style: TextStyle(color: Colors.black87, fontSize: 13),
         ),
         const SizedBox(height: 15),
         ElevatedButton.icon(
@@ -551,9 +792,9 @@ class _JournalScreenState extends State<JournalScreen> {
         const SizedBox(height: 15),
         Text(
           _formatDuration(session['tst']),
-          style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: themeColor),
+          style: TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: themeColor),
         ),
-        const Text("Total Sleep Time", style: TextStyle(fontSize: 12, color: Colors.grey)),
+        const Text("Total Sleep Time", style: TextStyle(fontSize: 13, color: Colors.black54)),
         const SizedBox(height: 20),
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
@@ -572,8 +813,8 @@ class _JournalScreenState extends State<JournalScreen> {
   Widget _buildMetricItem(String label, String value) {
     return Column(
       children: [
-        Text(value, style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF3F3B76))),
-        Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+        Text(value, style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF3F3B76), fontSize: 15)),
+        Text(label, style: const TextStyle(fontSize: 11, color: Colors.black54)),
       ],
     );
   }
@@ -598,7 +839,7 @@ class _JournalScreenState extends State<JournalScreen> {
           ),
         );
       },
-      child: const Text("View Full Breakdown", style: TextStyle(fontWeight: FontWeight.bold)),
+      child: const Text("View Full Breakdown", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
     );
   }
 
@@ -607,11 +848,16 @@ class _JournalScreenState extends State<JournalScreen> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.bedtime_outlined, size: 64, color: Colors.white.withOpacity(0.2)),
+          Icon(Icons.bedtime_outlined, size: 64, color: Colors.white.withOpacity(0.3)),
           const SizedBox(height: 16),
           const Text(
             "No sleep recordings found",
-            style: TextStyle(color: Colors.white54, fontSize: 16),
+            style: TextStyle(color: Colors.white70, fontSize: 16),
+          ),
+          const SizedBox(height: 8),
+          TextButton(
+            onPressed: _toggleDemoMode,
+            child: const Text("Tap to enable Demo Mode", style: TextStyle(color: Colors.cyanAccent)),
           ),
         ],
       ),

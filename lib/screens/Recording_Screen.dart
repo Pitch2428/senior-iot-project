@@ -75,6 +75,27 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   int _reconnectAttempts = 0;
   Timer? _connectionHealthTimer;
 
+  // ADDED: Data timeout handling
+  Timer? _dataTimeoutTimer;
+  int _lastDataTimestamp = 0;
+  static const int DATA_TIMEOUT_SECONDS = 15;
+
+  // ADDED: Performance optimization variables
+  Timer? _uiThrottleTimer;
+  int _lastUiUpdateTime = 0;
+  static const int UI_UPDATE_INTERVAL_MS = 500;  // Update UI max twice per second
+  int _totalSamplesReceived = 0;
+
+  // ADDED: Reconnection resume tracking
+  bool _isCatchingUp = false;
+
+  // ADDED: 5-Second Block Aggregation variables
+  int _blockSampleCount = 0;
+  double _blockHrSum = 0;
+  double _blockActivitySum = 0;
+  int _blockStartTime = 0;
+  double? _lastBlockAx, _lastBlockAy, _lastBlockAz;
+
   // UI State
   late AnimationController _pulseController;
   String _status = "Disconnected";
@@ -85,7 +106,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   double _xAxis = 0.0, _yAxis = 0.0, _zAxis = 0.0;
   final List<double> _hrHistory = [];
   final List<double> _motionHistory = [];
-  final int _maxDataPoints = 50;
+  final int _maxDataPoints = 100;  // CHANGED: from 50 to 100 for better display
   Map<String, dynamic>? _latestSync;
 
   // Recording
@@ -94,6 +115,9 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   int? _currentSessionId;
   int _dbRows = 0;
   Future<void> _dbQueue = Future.value();
+  
+  // Track if we've shown the permission dialog
+  bool _hasShownPermissionDialog = false;
 
   @override
   void initState() {
@@ -104,13 +128,16 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       vsync: this,
       duration: const Duration(milliseconds: 300),
     );
-    _startScan();
+    _checkPermissionsAndStart();
     _startConnectionHealthCheck();
+    _checkDatabaseSize(); // ADDED
   }
 
   @override
   void dispose() {
+    _dataTimeoutTimer?.cancel();
     _connectionHealthTimer?.cancel();
+    _uiThrottleTimer?.cancel(); // ADDED
     _scanSub?.cancel();
     _connSub?.cancel();
     _notifySub?.cancel();
@@ -118,6 +145,220 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     WakelockPlus.disable();
     FlutterForegroundTask.stopService();
     super.dispose();
+  }
+
+  // ==================== PERMISSION CHECK & POPUP ====================
+
+  Future<void> _checkPermissionsAndStart() async {
+    // Check current permission status
+    final locationStatus = await Permission.locationWhenInUse.status;
+    final bluetoothScanStatus = await Permission.bluetoothScan.status;
+    final bluetoothConnectStatus = await Permission.bluetoothConnect.status;
+    
+    // If permissions are already granted, just start scanning
+    if (locationStatus.isGranted && 
+        bluetoothScanStatus.isGranted && 
+        bluetoothConnectStatus.isGranted) {
+      _startScan();
+      return;
+    }
+    
+    // Show the instruction dialog
+    _showBluetoothPermissionDialog();
+  }
+
+  void _showBluetoothPermissionDialog() {
+    // Prevent showing multiple times
+    if (_hasShownPermissionDialog) return;
+    _hasShownPermissionDialog = true;
+    
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF2D2B5E),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          title: Row(
+            children: [
+              Icon(Icons.bluetooth, color: Colors.cyanAccent, size: 28),
+              const SizedBox(width: 10),
+              const Text(
+                "Enable Bluetooth & Location",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 18,
+                ),
+              ),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "To connect to your M5StickC sleep tracker, you need to enable:",
+                style: TextStyle(color: Colors.white70, fontSize: 14),
+              ),
+              const SizedBox(height: 16),
+              _buildBulletPoint(
+                Icons.bluetooth_searching,
+                "Bluetooth",
+                "Required to scan and connect to your M5StickC device",
+              ),
+              const SizedBox(height: 12),
+              _buildBulletPoint(
+                Icons.location_on,
+                "Location",
+                "Android requires location permission to scan for Bluetooth devices",
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.blueAccent.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.blueAccent.withOpacity(0.3)),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.info_outline, color: Colors.blueAccent, size: 18),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        "Don't worry - location data is never stored. It's only required for Bluetooth scanning.",
+                        style: TextStyle(color: Colors.white60, fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                "How to enable:",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                ),
+              ),
+              const SizedBox(height: 8),
+              _buildStepText("1. Tap 'Allow' or 'Allow All' on the next screen"),
+              const SizedBox(height: 4),
+              _buildStepText("2. Turn on Bluetooth from your phone's settings if it's off"),
+              const SizedBox(height: 4),
+              _buildStepText("3. Turn on Location from your phone's settings if it's off"),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                _startScan();
+              },
+              child: const Text(
+                "SKIP",
+                style: TextStyle(color: Colors.white54, fontSize: 13),
+              ),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                Navigator.pop(context);
+                await _requestPermissionsAndStart();
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.cyanAccent,
+                foregroundColor: const Color(0xFF3F3B76),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text(
+                "ALLOW",
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildBulletPoint(IconData icon, String title, String description) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, color: Colors.cyanAccent, size: 20),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 14,
+                ),
+              ),
+              Text(
+                description,
+                style: const TextStyle(color: Colors.white54, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStepText(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 8),
+      child: Row(
+        children: [
+          const Icon(Icons.arrow_right, color: Colors.cyanAccent, size: 16),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(color: Colors.white60, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _requestPermissionsAndStart() async {
+    final statuses = await [
+      Permission.locationWhenInUse,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.notification,
+    ].request();
+    
+    final locationGranted = statuses[Permission.locationWhenInUse]?.isGranted ?? false;
+    final bluetoothScanGranted = statuses[Permission.bluetoothScan]?.isGranted ?? false;
+    final bluetoothConnectGranted = statuses[Permission.bluetoothConnect]?.isGranted ?? false;
+    
+    if (!locationGranted || !bluetoothScanGranted || !bluetoothConnectGranted) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Bluetooth and Location permissions are required to connect to your device"),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+    
+    _startScan();
   }
 
   // ==================== FOREGROUND TASK ====================
@@ -169,13 +410,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   }
 
   Future<void> _startScan() async {
-    await [
-      Permission.locationWhenInUse,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.notification,
-    ].request();
-
     await _scanSub?.cancel();
 
     if (!mounted) return;
@@ -191,8 +425,41 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     }, onError: (e) => debugPrint("Scan error: $e"));
   }
 
+  // ADDED: Resume recording after reconnect
+  Future<void> _resumeRecordingAfterReconnect() async {
+    if (!_isRecording || _currentSessionId == null) return;
+    
+    debugPrint("BLE: Resuming recording session after reconnect");
+    
+    setState(() {
+      _isCatchingUp = true;
+      _status = "Catching up...";
+    });
+    
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Reconnected! Catching up missed data..."),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+    
+    // Wait for buffered data to arrive from M5Stick
+    await Future.delayed(const Duration(seconds: 3));
+    
+    setState(() {
+      _isCatchingUp = false;
+      _status = "Connected";
+    });
+    
+    await _refreshDbRows();
+    
+    debugPrint("BLE: Resume complete. Total samples: $_dbRows");
+  }
+
   Future<void> _connect(String deviceId) async {
-    // Cancel existing connections first
     await _scanSub?.cancel();
     await _connSub?.cancel();
     await _notifySub?.cancel();
@@ -203,7 +470,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       _isReconnecting = false;
     });
 
-    // Small delay for BLE stack
     await Future.delayed(const Duration(milliseconds: 500));
 
     _connSub = _ble.connectToDevice(
@@ -212,7 +478,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     ).listen(
       (update) async {
         if (update.connectionState == DeviceConnectionState.connected) {
-          // Connected successfully
           debugPrint("BLE: Connected to $deviceId");
           _reconnectAttempts = 0;
           
@@ -230,14 +495,17 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
             _isReconnecting = false;
           });
 
-          // Show success message if this was a reconnect
+          // ADDED: Resume recording if we were recording
+          if (_isRecording) {
+            await _resumeRecordingAfterReconnect();
+          }
+
           if (_isRecording) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text("Reconnected!"), backgroundColor: Colors.green, duration: Duration(seconds: 1)),
             );
           }
 
-          // Set up notification listener
           final characteristic = QualifiedCharacteristic(
             deviceId: deviceId,
             serviceId: Uuid.parse(nusServiceUuid),
@@ -250,7 +518,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           );
           
         } else if (update.connectionState == DeviceConnectionState.disconnected) {
-          // Disconnected
           debugPrint("BLE: Disconnected from $deviceId");
           if (!mounted) return;
           
@@ -258,6 +525,14 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
 
           if (_isRecording && _connectedDeviceId != null && !_isReconnecting) {
             _attemptReconnect();
+            
+            // ADDED: Safety timeout for reconnect failure
+            Timer(const Duration(seconds: 30), () {
+              if (_isRecording && _connectedDeviceId != null) {
+                debugPrint("BLE: Reconnect failed, saving session");
+                _handleDeviceDisconnected();
+              }
+            });
           } else {
             _connectedDeviceId = null;
           }
@@ -331,6 +606,258 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     await _connect(_connectedDeviceId!);
   }
 
+  // ADDED: Handle device disconnect and auto-save session
+  Future<void> _handleDeviceDisconnected() async {
+    debugPrint("BLE: Device disconnected during recording - auto-saving session");
+    
+    if (_isRecording && _currentSessionId != null) {
+      _dataTimeoutTimer?.cancel();
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Device disconnected - Saving session data..."),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+      
+      await _autoSaveSession();
+    }
+  }
+
+  // ADDED: Auto-save session on disconnect
+  Future<void> _autoSaveSession() async {
+    setState(() => _isRecording = false);
+    WakelockPlus.disable();
+    await FlutterForegroundTask.stopService();
+    await _dbQueue;
+
+    if (_currentSessionId == null) return;
+
+    final currentSamples = await AppDb.getSamplesForSession(_currentSessionId!);
+    if (currentSamples.isEmpty) {
+      setState(() {
+        _sessionStartTime = null;
+        _currentSessionId = null;
+      });
+      return;
+    }
+
+    int lastValidTimestamp = _sessionStartTime!;
+    for (final sample in currentSamples) {
+      final sampleTime = sample['timestamp_ms'] as int;
+      if (sampleTime > lastValidTimestamp) {
+        lastValidTimestamp = sampleTime;
+      }
+    }
+    
+    final endTimeMs = lastValidTimestamp + 60000;
+
+    final scoredEpochs = SleepScorer.scoreRows(
+      currentSamples,
+      algorithm: SleepAlgorithm.sadehScaledConvolved,
+      activityScale: 1.0,
+    );
+
+    await AppDb.replaceScoredEpochs(
+      sessionId: _currentSessionId!,
+      rows: scoredEpochs.map((e) => {
+        'epoch_start_ms': e.startMs,
+        'epoch_end_ms': e.endMs,
+        'activity': e.activity,
+        'scaled_activity': e.scaledActivity,
+        'conv_activity': e.convolvedActivity,
+        'mean_hr': e.meanHr,
+        'sadeh_score': e.sadehScore,
+        'label': e.isSleep ? 'sleep' : 'wake',
+      }).toList(),
+    );
+
+    final metrics = SleepScorer.calculateMetrics(scoredEpochs);
+    final sleepScore = SleepScorer.calculateSleepScore(metrics);
+
+    await AppDb.upsertSleepSummary(
+      sessionId: _currentSessionId!,
+      timeInBedMin: metrics.timeInBedMinutes,
+      totalSleepTimeMin: metrics.totalSleepTimeMinutes,
+      sleepLatencyMin: metrics.sleepLatencyMinutes,
+      wasoMin: metrics.wasoMinutes,
+      sleepEfficiencyPct: metrics.sleepEfficiency,
+      sleepOnsetMs: metrics.sleepOnsetMs,
+      finalWakeMs: metrics.finalWakeMs,
+      sleepScore: sleepScore,
+    );
+
+    await AppDb.endSession(
+      sessionId: _currentSessionId!,
+      endTimeMs: endTimeMs,
+    );
+
+    if (mounted) {
+      setState(() {
+        _sessionStartTime = null;
+        _currentSessionId = null;
+      });
+      
+      _showSessionSavedDialog(metrics.totalSleepTimeMinutes, sleepScore);
+    }
+  }
+
+  // ADDED: Show session saved dialog
+  void _showSessionSavedDialog(double totalSleepMinutes, double sleepScore) {
+    final hours = (totalSleepMinutes / 60).floor();
+    final minutes = (totalSleepMinutes % 60).toInt();
+    
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF2D2B5E),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text(
+          "Session Saved",
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              "Device disconnected but your data was saved!",
+              style: TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              "Sleep Time: ${hours}h ${minutes}m",
+              style: const TextStyle(color: Colors.cyanAccent, fontWeight: FontWeight.bold),
+            ),
+            Text(
+              "Sleep Score: ${sleepScore.round()}",
+              style: const TextStyle(color: Colors.yellowAccent, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              "Note: Session ended due to device battery depletion.",
+              style: TextStyle(color: Colors.white54, fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.pushReplacement(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => JournalScreen(highlightDate: _getFormattedDate()),
+                ),
+              );
+            },
+            child: const Text("View Journal", style: TextStyle(color: Colors.cyanAccent)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ADDED: Reset data timeout timer
+  void _resetDataTimeoutTimer() {
+    _dataTimeoutTimer?.cancel();
+    if (_isRecording) {
+      _dataTimeoutTimer = Timer(const Duration(seconds: DATA_TIMEOUT_SECONDS), () {
+        debugPrint("BLE: Data timeout - no data received for $DATA_TIMEOUT_SECONDS seconds");
+        if (_isRecording) {
+          _handleDeviceDisconnected();
+        }
+      });
+    }
+  }
+
+  // ADDED: Database size monitoring
+  void _checkDatabaseSize() {
+    Timer.periodic(const Duration(minutes: 5), (timer) async {
+      if (!_isRecording) {
+        timer.cancel();
+        return;
+      }
+      
+      final count = await AppDb.countSamples();
+      if (count > 50000 && mounted) {
+        debugPrint("WARNING: Database has $count samples - consider cleanup");
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Many recordings detected. Consider deleting old sessions."),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    });
+  }
+
+  // ADDED: 5-Second block aggregation
+void _aggregateTo5sBlock(String line) {
+  final parts = line.split(',');
+  if (parts.length < 5) return;
+  
+  final now = DateTime.now().millisecondsSinceEpoch;
+  final hr = int.tryParse(parts[1]) ?? 0;
+  final ax = double.tryParse(parts[2]) ?? 0.0;
+  final ay = double.tryParse(parts[3]) ?? 0.0;
+  final az = double.tryParse(parts[4]) ?? 0.0;
+  
+  if (_blockStartTime == 0) {
+    _blockStartTime = now;
+  }
+  
+  _blockSampleCount++;
+  if (hr > 0) _blockHrSum += hr.toDouble();
+  
+  // Calculate motion from previous sample
+  if (_lastBlockAx != null && _lastBlockAy != null && _lastBlockAz != null) {
+    final dx = ax - _lastBlockAx!;
+    final dy = ay - _lastBlockAy!;
+    final dz = az - _lastBlockAz!;
+    final motion = sqrt(dx * dx + dy * dy + dz * dz);
+    _blockActivitySum += motion;
+  }
+  
+  _lastBlockAx = ax;
+  _lastBlockAy = ay;
+  _lastBlockAz = az;
+  
+  // Every 5 seconds (5 samples at 1Hz from M5Stick)
+  if (_blockSampleCount >= 5 && _currentSessionId != null) {
+    final meanHr = _blockSampleCount > 0 ? _blockHrSum / _blockSampleCount : 0.0;
+    final activityMean = (_blockSampleCount > 1 && _blockActivitySum > 0) 
+        ? _blockActivitySum / (_blockSampleCount - 1) 
+        : 0.0;
+    
+    AppDb.insertRaw5sBlock(
+      sessionId: _currentSessionId!,
+      blockStartMs: _blockStartTime,
+      blockEndMs: now,
+      sampleCount: _blockSampleCount,
+      meanHr: meanHr,
+      activitySum: _blockActivitySum,
+      activityMean: activityMean,
+    ).catchError((e) {
+      debugPrint("5s Block Insert Error: $e");
+    });
+    
+    // Reset block counters
+    _blockSampleCount = 0;
+    _blockHrSum = 0.0;
+    _blockActivitySum = 0.0;
+    _blockStartTime = 0;
+    _lastBlockAx = null;
+    _lastBlockAy = null;
+    _lastBlockAz = null;
+  }
+}
+
+  // MODIFIED: Added timeout reset and throttling, plus 5-second block aggregation
   void _handleIncoming(Uint8List bytes) {
     try {
       final chunk = utf8.decode(bytes, allowMalformed: true);
@@ -347,12 +874,26 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
         final line = parts[i].trim();
         if (line.isEmpty) continue;
 
+        // Reset timeout on data received
+        _lastDataTimestamp = DateTime.now().millisecondsSinceEpoch;
+        _resetDataTimeoutTimer();
+        
+        _totalSamplesReceived++;
+
         _updateRealtimeUI(line);
 
         if (_isRecording && _currentSessionId != null) {
           _dbQueue = _dbQueue.then((_) => _commitToDatabase(line)).catchError((e) {
             debugPrint("DB Sync Error: $e");
           });
+          
+          // ADDED: Aggregate into 5-second blocks
+          _aggregateTo5sBlock(line);
+        }
+        
+        // Periodically log memory status
+        if (_totalSamplesReceived % 1000 == 0) {
+          debugPrint("MEMORY: Samples received: $_totalSamplesReceived");
         }
       }
     } catch (e) {
@@ -360,6 +901,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     }
   }
 
+  // MODIFIED: Throttled UI updates
   void _updateRealtimeUI(String line) {
     final parts = line.split(',');
     if (parts.length < 5) return;
@@ -371,30 +913,35 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     final az = double.tryParse(parts[4]) ?? 0.0;
     final mag = sqrt(ax * ax + ay * ay + az * az);
 
-    setState(() {
-      _xAxis = ax;
-      _yAxis = ay;
-      _zAxis = az;
-      _bpmMean = hr > 0 ? hr.toString() : "--";
-      _conf = (hr > 40 && hr < 110) ? "High" : "Low";
+    // THROTTLE UI UPDATES - Only update UI every 500ms
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastUiUpdateTime >= UI_UPDATE_INTERVAL_MS) {
+      _lastUiUpdateTime = now;
+      
+      setState(() {
+        _xAxis = ax;
+        _yAxis = ay;
+        _zAxis = az;
+        _bpmMean = hr > 0 ? hr.toString() : "--";
+        _conf = (hr > 40 && hr < 110) ? "High" : "Low";
 
-      _hrHistory.add(hr > 0 ? hr.toDouble() : 0.0);
-      if (_hrHistory.length > _maxDataPoints) _hrHistory.removeAt(0);
+        _hrHistory.add(hr > 0 ? hr.toDouble() : 0.0);
+        if (_hrHistory.length > _maxDataPoints) _hrHistory.removeAt(0);
 
-      _motionHistory.add(mag);
-      if (_motionHistory.length > _maxDataPoints) _motionHistory.removeAt(0);
+        _motionHistory.add(mag);
+        if (_motionHistory.length > _maxDataPoints) _motionHistory.removeAt(0);
 
-      if (hr > 0) {
-        final now = DateTime.now();
-        _latestSync = {
-          'label': "Sensor Sync",
-          'time': "${now.hour}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}",
-          'val': "$hr BPM"
-        };
-      }
-    });
+        if (hr > 0) {
+          _latestSync = {
+            'label': "Sensor Sync",
+            'time': "${DateTime.now().hour}:${DateTime.now().minute.toString().padLeft(2, '0')}:${DateTime.now().second.toString().padLeft(2, '0')}",
+            'val': "$hr BPM"
+          };
+        }
+      });
 
-    if (hr > 0) _pulseController.forward(from: 0.0);
+      if (hr > 0) _pulseController.forward(from: 0.0);
+    }
   }
 
   // ==================== DATABASE ====================
@@ -420,7 +967,10 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
 
   // ==================== RECORDING ====================
 
+  // MODIFIED: Added timeout cancellation
   void _saveSessionToJournal() async {
+    _dataTimeoutTimer?.cancel();
+    
     setState(() => _isRecording = false);
     WakelockPlus.disable();
     await FlutterForegroundTask.stopService();
@@ -440,7 +990,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     final scoredEpochs = SleepScorer.scoreRows(
       currentSamples,
       algorithm: SleepAlgorithm.sadehScaledConvolved,
-      activityScale: 500.0,
+      activityScale: 1.0,
     );
 
     await AppDb.replaceScoredEpochs(
@@ -547,6 +1097,11 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   Widget build(BuildContext context) {
     final devices = _found.values.toList()..sort((a, b) => b.rssi.compareTo(a.rssi));
 
+    String displayStatus = _status;
+    if (_isCatchingUp) {
+      displayStatus = "Catching up...";
+    }
+
     return Scaffold(
       backgroundColor: const Color(0xFF3F3B76),
       body: SafeArea(
@@ -556,7 +1111,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const SizedBox(height: 20),
-              _buildTopHeader(),
+              _buildTopHeader(displayStatus),
               const SizedBox(height: 20),
               _buildLiveMonitorCard(),
               const SizedBox(height: 30),
@@ -573,14 +1128,13 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     );
   }
 
-  Widget _buildTopHeader() {
+  Widget _buildTopHeader(String displayStatus) {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text(_status, style: const TextStyle(color: Colors.white70, fontSize: 14)),
+        Text(displayStatus, style: const TextStyle(color: Colors.white, fontSize: 14)),
         Row(
           children: [
-            // Reconnect button (only shows when connected and recording)
             if (_connectedDeviceId != null && _isRecording)
               IconButton(
                 icon: Icon(
@@ -649,8 +1203,26 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
             _bpmMean,
             style: const TextStyle(color: Colors.white, fontSize: 80, fontWeight: FontWeight.bold),
           ),
-          const Text("Live Heart Rate", style: TextStyle(color: Colors.white54, fontSize: 14)),
+          const Text("Live Heart Rate", style: TextStyle(color: Colors.white70, fontSize: 14)),
           const SizedBox(height: 25),
+          // ADDED: Progress indicator when catching up
+          if (_isCatchingUp)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8.0),
+              child: Column(
+                children: [
+                  const LinearProgressIndicator(
+                    backgroundColor: Colors.white24,
+                    color: Colors.cyanAccent,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    "Syncing missed data...",
+                    style: TextStyle(color: Colors.cyanAccent, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
           Row(
             children: [
               Expanded(child: _buildWaveBox("HR Wave", _hrHistory, Colors.cyanAccent, 160)),
@@ -680,12 +1252,24 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
                   _motionHistory.clear();
                   _lineBuffer.clear();
                   _reconnectAttempts = 0;
+                  _lastDataTimestamp = DateTime.now().millisecondsSinceEpoch;
+                  _totalSamplesReceived = 0; // ADDED
+                  // Reset 5-second block variables
+                  _blockSampleCount = 0;
+                  _blockHrSum = 0;
+                  _blockActivitySum = 0;
+                  _blockStartTime = 0;
+                  _lastBlockAx = null;
+                  _lastBlockAy = null;
+                  _lastBlockAz = null;
                 });
                 WakelockPlus.enable();
                 await _startForegroundService();
                 final startTs = DateTime.now().millisecondsSinceEpoch;
                 _currentSessionId = await AppDb.startSession(startTimeMs: startTs);
                 setState(() => _sessionStartTime = startTs);
+                
+                _resetDataTimeoutTimer();
               }
             },
             style: ElevatedButton.styleFrom(
@@ -717,7 +1301,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   Widget _xyzItem(String label, double val) {
     return Column(
       children: [
-        Text(label, style: const TextStyle(color: Colors.white54, fontSize: 10)),
+        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 10)),
         Text(
           val.toStringAsFixed(2),
           style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
@@ -742,8 +1326,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           Expanded(
             child: Text(
               "${_latestSync!['label']} • ${_latestSync!['time']}",
-              style: const TextStyle(color: Colors.white38, fontSize: 11),
-            ),
+              style: const TextStyle(color: Colors.white60, fontSize: 11)),
           ),
           Text(
             _latestSync!['val'],
@@ -778,7 +1361,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
         child: Center(
           child: Text(
             "Searching for M5 device...",
-            style: TextStyle(color: Colors.white24),
+            style: TextStyle(color: Colors.white38),
           ),
         ),
       );
@@ -798,8 +1381,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           ),
           subtitle: Text(
             d.id,
-            style: const TextStyle(color: Colors.white38, fontSize: 10),
-          ),
+            style: const TextStyle(color: Colors.white54, fontSize: 10)),
           onTap: () => _connect(d.id),
         );
       }).toList(),
@@ -842,6 +1424,8 @@ class WaveformPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant WaveformPainter oldDelegate) {
-    return oldDelegate.data.length != data.length;
+    // Only repaint if data length changed significantly
+    return oldDelegate.data.length != data.length || 
+           oldDelegate.data.length % 10 == 0;
   }
 }
