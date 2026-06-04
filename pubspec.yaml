@@ -1,29 +1,30 @@
-name: sleep_ble_logger
-description: "Sleep BLE Logger"
-publish_to: "none"
+name: isleep
+description: "i-Sleep: An IoT-Based Sleep Tracking System - Senior Project SP2025-49"
+publish_to: 'none'
+
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.10.7
+  sdk: '>=3.0.0 <4.0.0'
 
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8
 
-  flutter_reactive_ble: ^5.4.0
-  permission_handler: ^11.3.1
-
-  sqflite: ^2.3.3+1
-  path: ^1.9.0
-  path_provider: ^2.1.4
-
-  share_plus: ^10.0.2
-
+  cupertino_icons: ^1.0.9
+  intl: ^0.19.0                 # Handles formatting for timestamps and sleep hours
+  flutter_reactive_ble: ^5.5.0 # Upgraded to match environment preference
+  shared_preferences: ^2.2.3    # For user profile configurations
+  path_provider: ^2.1.1         # For finding local database sandboxes
+  sqflite: ^2.4.2+1             # Exact clean resolvable version for AppDb.dart
+  permission_handler: ^12.0.3   # Upgraded to your environment's clean resolvable version
+  wakelock_plus: ^1.1.4        # Keeps CPU/display active during overnight recording
+  flutter_foreground_task: ^9.2.2 # Keeps background tasks running all night safely
+  share_plus: ^13.1.0          
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^6.0.0
+  flutter_lints: ^3.0.0
 
 flutter:
   uses-material-design: true
