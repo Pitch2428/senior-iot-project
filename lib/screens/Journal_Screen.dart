@@ -5,14 +5,11 @@ import 'package:path_provider/path_provider.dart';
 import '../Database/AppDb.dart';
 import '../screens/history_screen.dart';
 import '../logic/sadeh.dart';
-import 'dart:ui' as ui;
-import 'package:flutter/rendering.dart';
 
 // ==================== CONSTANTS ====================
 
 const _scoreColorExcellent = Color(0xFF4CAF50);
 const _scoreColorGood = Color(0xFF8BC34A);
-const _scoreColorFair = Color(0xFFFFC107);
 const _scoreColorPoor = Color(0xFFFF9800);
 const _scoreColorVeryPoor = Color(0xFFF44336);
 
